@@ -3,6 +3,8 @@ package com.nike.riposte.server.channelpipeline;
 import com.nike.internal.util.StringUtils;
 import com.nike.riposte.client.asynchttp.netty.StreamingAsyncHttpClient;
 import com.nike.riposte.metrics.MetricsListener;
+import com.nike.riposte.server.config.ServerConfig;
+import com.nike.riposte.server.config.ServerConfig.HttpRequestDecoderConfig;
 import com.nike.riposte.server.error.exception.DownstreamIdleChannelTimeoutException;
 import com.nike.riposte.server.error.handler.RiposteErrorHandler;
 import com.nike.riposte.server.error.handler.RiposteUnhandledErrorHandler;
@@ -15,6 +17,7 @@ import com.nike.riposte.server.handler.DTraceEndHandler;
 import com.nike.riposte.server.handler.DTraceStartHandler;
 import com.nike.riposte.server.handler.ExceptionHandlingHandler;
 import com.nike.riposte.server.handler.IdleChannelTimeoutHandler;
+import com.nike.riposte.server.handler.IncompleteHttpCallTimeoutHandler;
 import com.nike.riposte.server.handler.NonblockingEndpointExecutionHandler;
 import com.nike.riposte.server.handler.OpenChannelLimitHandler;
 import com.nike.riposte.server.handler.ProcessFinalResponseOutputHandler;
@@ -30,6 +33,7 @@ import com.nike.riposte.server.handler.ResponseSenderHandler;
 import com.nike.riposte.server.handler.RoutingHandler;
 import com.nike.riposte.server.handler.SecurityValidationHandler;
 import com.nike.riposte.server.handler.SmartHttpContentCompressor;
+import com.nike.riposte.server.handler.SmartHttpContentDecompressor;
 import com.nike.riposte.server.hooks.PipelineCreateHook;
 import com.nike.riposte.server.http.Endpoint;
 import com.nike.riposte.server.http.RequestInfo;
@@ -42,6 +46,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.Executor;
@@ -92,6 +97,12 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
      * request.
      */
     public static final String IDLE_CHANNEL_TIMEOUT_HANDLER_NAME = "IdleChannelTimeoutHandler";
+    /**
+     * The name of the {@link IncompleteHttpCallTimeoutHandler} handler in the pipeline. This handler may or may not be
+     * present in the pipeline depending on the value of {@link #incompleteHttpCallTimeoutMillis} and the current state
+     * of the request.
+     */
+    public static final String INCOMPLETE_HTTP_CALL_TIMEOUT_HANDLER_NAME = "IncompleteHttpCallTimeoutHandler";
 
     // Inbound or in/out handlers
     /**
@@ -120,6 +131,10 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
      */
     public static final String SMART_HTTP_CONTENT_COMPRESSOR_HANDLER_NAME = "SmartHttpContentCompressorHandler";
     /**
+     * The name of the {@link SmartHttpContentDecompressor} handler in the pipeline.
+     */
+    public static final String SMART_HTTP_CONTENT_DECOMPRESSOR_HANDLER_NAME = "SmartHttpContentDecompressorHandler";
+    /**
      * The name of the {@link RequestInfoSetterHandler} handler in the pipeline.
      */
     public static final String REQUEST_INFO_SETTER_HANDLER_NAME = "RequestInfoSetterHandler";
@@ -128,9 +143,13 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
      */
     public static final String OPEN_CHANNEL_LIMIT_HANDLER_NAME = "OpenChannelLimitHandler";
     /**
-     * The name of the {@link RequestFilterHandler} handler in the pipeline.
+     * The name of the {@link RequestFilterHandler} before security handler in the pipeline.
      */
-    public static final String REQUEST_FILTER_HANDLER_NAME = "RequestFilterHandler";
+    public static final String REQUEST_FILTER_BEFORE_SECURITY_HANDLER_NAME = "BeforeSecurityRequestFilterHandler";
+    /**
+     * The name of the {@link RequestFilterHandler} after security handler in the pipeline.
+     */
+    public static final String REQUEST_FILTER_AFTER_SECURITY_HANDLER_NAME = "AfterSecurityRequestFilterHandler";
     /**
      * The name of the {@link RoutingHandler} handler in the pipeline.
      */
@@ -212,13 +231,17 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
     private final List<PipelineCreateHook> pipelineCreateHooks;
     private final RequestSecurityValidator requestSecurityValidator;
     private final long workerChannelIdleTimeoutMillis;
+    private final long incompleteHttpCallTimeoutMillis;
     private final int maxOpenChannelsThreshold;
     private final ChannelGroup openChannelsGroup;
     private final boolean debugChannelLifecycleLoggingEnabled;
+    private final int responseCompressionThresholdBytes;
+    private final HttpRequestDecoderConfig httpRequestDecoderConfig;
 
     private final StreamingAsyncHttpClient streamingAsyncHttpClientForProxyRouterEndpoints;
 
-    private final RequestFilterHandler cachedRequestFilterHandler;
+    private final RequestFilterHandler beforeSecurityRequestFilterHandler;
+    private final RequestFilterHandler afterSecurityRequestFilterHandler;
     private final ResponseFilterHandler cachedResponseFilterHandler;
 
     private final List<String> userIdHeaderKeys;
@@ -229,7 +252,7 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
      *     handle normal non-SSL (HTTP) requests.
      * @param maxRequestSizeInBytes
      *     The max allowed request size in bytes. If a request exceeds this value then a {@link
-     *     io.netty.handler.codec.TooLongFrameException} will be thrown.
+     *     com.nike.riposte.server.error.exception.RequestTooBigException} will be thrown.
      *     WARNING: Not currently implemented - this argument will do nothing for now.
      * @param endpoints
      *     The list of endpoints that should be registered with each channel. Cannot be null or empty.
@@ -279,10 +302,17 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
      * @param proxyRouterConnectTimeoutMillis
      *     The amount of time in milliseconds that a proxy/router endpoint should attempt to connect to the downstream
      *     service before giving up and throwing a connection timeout exception. Set this to 0 to disable connection
-     *     timeouts entirely, which is REALLY DEFINITELY NOT RECOMMENDED and you do so at your own risk.
+     *     timeouts entirely, which is REALLY DEFINITELY NOT RECOMMENDED and you do so at your own risk. See {@link
+     *     ServerConfig#proxyRouterConnectTimeoutMillis()}
+     * @param incompleteHttpCallTimeoutMillis
+     *     The amount of idle time in milliseconds that the server should wait before throwing an
+     *     incomplete-http-call-timeout when the request has been started (we've received at least one chunk of the
+     *     request) but before the last chunk of the request is received. Set this to a value less than or equal to 0
+     *     to disable incomplete-call-timeouts entirely, which is not recommended. See {@link
+     *     ServerConfig#incompleteHttpCallTimeoutMillis()}.
      * @param maxOpenChannelsThreshold
      *     The max number of incoming server channels allowed to be open. -1 indicates unlimited. See {@link
-     *     com.nike.riposte.server.config.ServerConfig#maxOpenIncomingServerChannels()} for details on how this is
+     *     ServerConfig#maxOpenIncomingServerChannels()} for details on how this is
      *     used.
      * @param debugChannelLifecycleLoggingEnabled
      *     Whether or not a {@link LoggingHandler} should be added to the channel pipeline, which gives detailed
@@ -308,9 +338,12 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
                                   RequestSecurityValidator requestSecurityValidator,
                                   long workerChannelIdleTimeoutMillis,
                                   long proxyRouterConnectTimeoutMillis,
+                                  long incompleteHttpCallTimeoutMillis,
                                   int maxOpenChannelsThreshold,
                                   boolean debugChannelLifecycleLoggingEnabled,
-                                  List<String> userIdHeaderKeys) {
+                                  List<String> userIdHeaderKeys,
+                                  int responseCompressionThresholdBytes,
+                                  HttpRequestDecoderConfig httpRequestDecoderConfig) {
         if (endpoints == null || endpoints.isEmpty())
             throw new IllegalArgumentException("endpoints cannot be empty");
 
@@ -325,6 +358,10 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
 
         if (responseSender == null)
             throw new IllegalArgumentException("responseSender cannot be null");
+
+        if (httpRequestDecoderConfig == null) {
+            httpRequestDecoderConfig = HttpRequestDecoderConfig.DEFAULT_IMPL;
+        }
 
         this.sslCtx = sslCtx;
         this.maxRequestSizeInBytes = maxRequestSizeInBytes;
@@ -357,6 +394,7 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
 
         this.workerChannelIdleTimeoutMillis = workerChannelIdleTimeoutMillis;
         this.maxOpenChannelsThreshold = maxOpenChannelsThreshold;
+        this.incompleteHttpCallTimeoutMillis = incompleteHttpCallTimeoutMillis;
         openChannelsGroup = (maxOpenChannelsThreshold == -1)
                             ? null
                             : new DefaultChannelGroup(GlobalEventExecutor.INSTANCE);
@@ -367,9 +405,30 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
         );
 
         boolean hasReqResFilters = requestAndResponseFilters != null && !requestAndResponseFilters.isEmpty();
-        cachedRequestFilterHandler = (hasReqResFilters) ? new RequestFilterHandler(requestAndResponseFilters) : null;
+
+        if (hasReqResFilters) {
+            List<RequestAndResponseFilter> beforeSecurityFilters = new ArrayList<>();
+            List<RequestAndResponseFilter> afterSecurityFilters = new ArrayList<>();
+
+            requestAndResponseFilters.forEach(requestAndResponseFilter -> {
+                if (requestAndResponseFilter.shouldExecuteBeforeSecurityValidation()) {
+                    beforeSecurityFilters.add(requestAndResponseFilter);
+                } else {
+                    afterSecurityFilters.add(requestAndResponseFilter);
+                }
+            });
+
+            beforeSecurityRequestFilterHandler = beforeSecurityFilters.isEmpty()? null : new RequestFilterHandler(beforeSecurityFilters);
+            afterSecurityRequestFilterHandler = afterSecurityFilters.isEmpty()? null : new RequestFilterHandler(afterSecurityFilters);
+        } else {
+            beforeSecurityRequestFilterHandler = null;
+            afterSecurityRequestFilterHandler = null;
+        }
+
         cachedResponseFilterHandler = (hasReqResFilters) ? new ResponseFilterHandler(requestAndResponseFilters) : null;
         this.userIdHeaderKeys = userIdHeaderKeys;
+        this.responseCompressionThresholdBytes = responseCompressionThresholdBytes;
+        this.httpRequestDecoderConfig = httpRequestDecoderConfig;
     }
 
     @Override
@@ -401,28 +460,46 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
 
         // INBOUND - Add HttpRequestDecoder so that incoming messages are translated into the appropriate HttpMessage
         //           objects.
-        p.addLast(HTTP_REQUEST_DECODER_HANDLER_NAME, new HttpRequestDecoder());
+        p.addLast(HTTP_REQUEST_DECODER_HANDLER_NAME,
+                  new HttpRequestDecoder(
+                      httpRequestDecoderConfig.maxInitialLineLength(),
+                      httpRequestDecoderConfig.maxHeaderSize(),
+                      httpRequestDecoderConfig.maxChunkSize()
+                  )
+        );
         // INBOUND - Now that the message is translated into HttpMessages we can add RequestStateCleanerHandler to
         //           setup/clean state for the rest of the pipeline.
-        p.addLast(REQUEST_STATE_CLEANER_HANDLER_NAME, new RequestStateCleanerHandler(metricsListener));
+        p.addLast(REQUEST_STATE_CLEANER_HANDLER_NAME, new RequestStateCleanerHandler(metricsListener,
+                                                                                     incompleteHttpCallTimeoutMillis));
         // INBOUND - Add DTraceStartHandler to start the distributed tracing for this request
         p.addLast(DTRACE_START_HANDLER_NAME, new DTraceStartHandler(userIdHeaderKeys));
         // INBOUND - Access log start
         p.addLast(ACCESS_LOG_START_HANDLER_NAME, new AccessLogStartHandler());
 
-        // TODO: Now that HttpObjectAggregator is gone, we need to add a handler that counts incoming request bytes and
-        //       throws a TooLongFrameException the instant we detect that a chunk puts the total request size above
-        //       maxRequestSizeInBytes. Might be able to roll that functionality into RequestInfoSetterHandler
-
         // IN/OUT - Add SmartHttpContentCompressor for automatic content compression (if appropriate for the
         //          request/response/size threshold). This must be after HttpRequestDecoder on the incoming pipeline and
         //          before HttpResponseEncoder on the outbound pipeline (keep in mind that "before" on outbound means
         //          later in the list since outbound is processed in reverse order).
-        // TODO: Make the threshold configurable
-        p.addLast(SMART_HTTP_CONTENT_COMPRESSOR_HANDLER_NAME, new SmartHttpContentCompressor(500));
+        p.addLast(SMART_HTTP_CONTENT_COMPRESSOR_HANDLER_NAME,
+                  new SmartHttpContentCompressor(responseCompressionThresholdBytes));
 
-        // INBOUND - Add RequestInfoSetterHandler to populate our request state with a RequestInfo object
-        p.addLast(REQUEST_INFO_SETTER_HANDLER_NAME, new RequestInfoSetterHandler());
+        // INBOUND - Add the "before security" RequestFilterHandler before security and even before routing
+        //      (if we have any filters to apply). This is here before RoutingHandler so that it can intercept requests
+        //      before RoutingHandler throws 404s/405s.
+        if (beforeSecurityRequestFilterHandler != null)
+            p.addLast(REQUEST_FILTER_BEFORE_SECURITY_HANDLER_NAME, beforeSecurityRequestFilterHandler);
+
+        // INBOUND - Add RoutingHandler to figure out which endpoint should handle the request and set it on our request
+        //           state for later execution
+        p.addLast(ROUTING_HANDLER_NAME, new RoutingHandler(endpoints, maxRequestSizeInBytes));
+
+        // INBOUND - Add SmartHttpContentDecompressor for automatic content decompression if the request indicates it
+        //           is compressed *and* the target endpoint (determined by the previous RoutingHandler) is one that
+        //           is eligible for auto-decompression.
+        p.addLast(SMART_HTTP_CONTENT_DECOMPRESSOR_HANDLER_NAME, new SmartHttpContentDecompressor());
+
+        // INBOUND - Add RequestInfoSetterHandler to populate our RequestInfo's content.
+        p.addLast(REQUEST_INFO_SETTER_HANDLER_NAME, new RequestInfoSetterHandler(maxRequestSizeInBytes));
         // INBOUND - Add OpenChannelLimitHandler to limit the number of open incoming server channels, but only if
         //           maxOpenChannelsThreshold is not -1.
         if (maxOpenChannelsThreshold != -1) {
@@ -430,16 +507,12 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
                       new OpenChannelLimitHandler(openChannelsGroup, maxOpenChannelsThreshold));
         }
 
-        // INBOUND - Add the RequestFilterHandler (if we have any filters to apply).
-        if (cachedRequestFilterHandler != null)
-            p.addLast(REQUEST_FILTER_HANDLER_NAME, cachedRequestFilterHandler);
-
-        // INBOUND - Add RoutingHandler to figure out which endpoint should handle the request and set it on our request
-        //           state for later execution
-        p.addLast(ROUTING_HANDLER_NAME, new RoutingHandler(endpoints));
-
         // INBOUND - Add SecurityValidationHandler to validate the RequestInfo object for the matching endpoint
         p.addLast(SECURITY_VALIDATION_HANDLER_NAME, new SecurityValidationHandler(requestSecurityValidator));
+
+        // INBOUND - Add the RequestFilterHandler for after security (if we have any filters to apply).
+        if (afterSecurityRequestFilterHandler != null)
+            p.addLast(REQUEST_FILTER_AFTER_SECURITY_HANDLER_NAME, afterSecurityRequestFilterHandler);
 
         // INBOUND - Now that the request state knows which endpoint will be called we can try to deserialize the
         //           request content (if desired by the endpoint)
@@ -488,7 +561,7 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
         p.addLast(
             CHANNEL_PIPELINE_FINALIZER_HANDLER_NAME,
             new ChannelPipelineFinalizerHandler(
-                exceptionHandlingHandler, responseSender, metricsListener, workerChannelIdleTimeoutMillis
+                exceptionHandlingHandler, responseSender, metricsListener, accessLogger, workerChannelIdleTimeoutMillis
             )
         );
 

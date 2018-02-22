@@ -22,7 +22,6 @@ import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.LastHttpContent;
-import io.netty.util.ReferenceCountUtil;
 
 /**
  * Handler for executing the request filtering side of the {@link RequestAndResponseFilter}s associated with this
@@ -37,6 +36,7 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
 
     private final Logger logger = LoggerFactory.getLogger(this.getClass());
 
+    protected final RiposteHandlerInternalUtil handlerUtils = RiposteHandlerInternalUtil.DEFAULT_IMPL;
     protected final List<RequestAndResponseFilter> filters;
 
     public RequestFilterHandler(List<RequestAndResponseFilter> filters) {
@@ -53,10 +53,10 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
     protected PipelineContinuationBehavior handleFilterLogic(
         ChannelHandlerContext ctx,
         Object msg,
+        HttpProcessingState state,
         BiFunction<RequestAndResponseFilter, RequestInfo, RequestInfo> normalFilterCall,
         BiFunction<RequestAndResponseFilter, RequestInfo, Pair<RequestInfo, Optional<ResponseInfo<?>>>> shortCircuitFilterCall
     ) {
-        HttpProcessingState state = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
         RequestInfo<?> currentReqInfo = state.getRequestInfo();
 
         // Run through each filter.
@@ -85,13 +85,6 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
 
                             state.setRequestInfo(currentReqInfo);
                             state.setResponseInfo(responseInfo);
-
-                            // We're done with the message since we're short circuiting. Release it (if the RequestInfo
-                            //      object is collecting chunks in order to build the raw content string then it will
-                            //      have retain()-ed the message already and this release won't cause the msg's
-                            //      reference count to fall below 1, but from the pipeline's point of view we're done
-                            //      with this message so we call release).
-                            ReferenceCountUtil.release(msg);
 
                             // Fire the short-circuit event that will get the desired response info sent to the caller.
                             ctx.fireChannelRead(LastOutboundMessageSendFullResponseInfo.INSTANCE);
@@ -125,6 +118,12 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
     @Override
     public PipelineContinuationBehavior doChannelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
         if (msg instanceof HttpRequest) {
+            HttpProcessingState state = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
+            handlerUtils.createRequestInfoFromNettyHttpRequestAndHandleStateSetupIfNecessary(
+                (HttpRequest)msg,
+                state
+            );
+
             BiFunction<RequestAndResponseFilter, RequestInfo, RequestInfo> normalFilterCall =
                 (filter, request) -> filter.filterRequestFirstChunkNoPayload(request, ctx);
 
@@ -132,10 +131,12 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
                 shortCircuitFilterCall =
                 (filter, request) -> filter.filterRequestFirstChunkWithOptionalShortCircuitResponse(request, ctx);
 
-            return handleFilterLogic(ctx, msg, normalFilterCall, shortCircuitFilterCall);
+            return handleFilterLogic(ctx, msg, state, normalFilterCall, shortCircuitFilterCall);
         }
 
         if (msg instanceof LastHttpContent) {
+            HttpProcessingState state = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
+            
             BiFunction<RequestAndResponseFilter, RequestInfo, RequestInfo> normalFilterCall =
                 (filter, request) -> filter.filterRequestLastChunkWithFullPayload(request, ctx);
 
@@ -143,7 +144,7 @@ public class RequestFilterHandler extends BaseInboundHandlerWithTracingAndMdcSup
                 shortCircuitFilterCall =
                 (filter, request) -> filter.filterRequestLastChunkWithOptionalShortCircuitResponse(request, ctx);
 
-            return handleFilterLogic(ctx, msg, normalFilterCall, shortCircuitFilterCall);
+            return handleFilterLogic(ctx, msg, state, normalFilterCall, shortCircuitFilterCall);
         }
 
         // Not the first or last chunk. No filters were executed, so continue normally.

@@ -240,8 +240,8 @@ public class RequestInfoTest {
         }
 
         @Override
-        public void addContentChunk(HttpContent chunk) {
-
+        public int addContentChunk(HttpContent chunk) {
+            return 0;
         }
 
         @Override
@@ -262,6 +262,11 @@ public class RequestInfoTest {
         @Override
         public void releaseMultipartData() {
 
+        }
+
+        @Override
+        public String getPathTemplate() {
+            return null;
         }
 
         @Override

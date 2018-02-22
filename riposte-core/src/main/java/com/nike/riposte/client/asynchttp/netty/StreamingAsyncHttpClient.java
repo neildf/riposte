@@ -3,13 +3,16 @@ package com.nike.riposte.client.asynchttp.netty;
 import com.nike.backstopper.exception.WrapperException;
 import com.nike.internal.util.Pair;
 import com.nike.riposte.client.asynchttp.netty.downstreampipeline.DownstreamIdleChannelTimeoutHandler;
+import com.nike.riposte.server.channelpipeline.ChannelAttributes;
 import com.nike.riposte.server.error.exception.DownstreamChannelClosedUnexpectedlyException;
 import com.nike.riposte.server.error.exception.DownstreamIdleChannelTimeoutException;
 import com.nike.riposte.server.error.exception.HostnameResolutionException;
 import com.nike.riposte.server.error.exception.NativeIoExceptionWrapper;
+import com.nike.riposte.server.http.HttpProcessingState;
+import com.nike.riposte.server.http.RequestInfo;
 import com.nike.wingtips.Span;
-import com.nike.wingtips.TraceHeaders;
 import com.nike.wingtips.Tracer;
+import com.nike.wingtips.http.HttpRequestTracingUtils;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +45,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ChannelPipeline;
+import io.netty.channel.ChannelPromise;
 import io.netty.channel.CombinedChannelDuplexHandler;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -64,7 +68,6 @@ import io.netty.handler.codec.http.FullHttpResponse;
 import io.netty.handler.codec.http.HttpClientCodec;
 import io.netty.handler.codec.http.HttpContent;
 import io.netty.handler.codec.http.HttpHeaders;
-import io.netty.handler.codec.http.HttpMessage;
 import io.netty.handler.codec.http.HttpObject;
 import io.netty.handler.codec.http.HttpObjectDecoder;
 import io.netty.handler.codec.http.HttpObjectEncoder;
@@ -83,12 +86,10 @@ import io.netty.util.concurrent.DefaultThreadFactory;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.Promise;
 
+import static com.nike.riposte.server.handler.ProxyRouterEndpointExecutionHandler.DOWNSTREAM_CALL_CONNECTION_SETUP_TIME_NANOS_REQUEST_ATTR_KEY;
 import static com.nike.riposte.util.AsyncNettyHelper.linkTracingAndMdcToCurrentThread;
 import static com.nike.riposte.util.AsyncNettyHelper.runnableWithTracingAndMdc;
 import static com.nike.riposte.util.AsyncNettyHelper.unlinkTracingAndMdcFromCurrentThread;
-import static io.netty.handler.codec.http.HttpHeaders.Names.CONTENT_LENGTH;
-import static io.netty.handler.codec.http.HttpHeaders.Names.TRANSFER_ENCODING;
-import static io.netty.handler.codec.http.HttpHeaders.Values.CHUNKED;
 
 /**
  * TODO: Class Description
@@ -119,7 +120,7 @@ public class StreamingAsyncHttpClient {
     private final boolean debugChannelLifecycleLoggingEnabled;
     private final long idleChannelTimeoutMillis;
     private final int downstreamConnectionTimeoutMillis;
-    private static final AttributeKey<Boolean> CHANNEL_IS_BROKEN_ATTR = AttributeKey.newInstance("channelIsBroken");
+    protected static final AttributeKey<Boolean> CHANNEL_IS_BROKEN_ATTR = AttributeKey.newInstance("channelIsBroken");
     private final ProxyRouterChannelHealthChecker CHANNEL_HEALTH_CHECK_INSTANCE = new ProxyRouterChannelHealthChecker();
     public final static String SHOULD_LOG_BAD_MESSAGES_AFTER_REQUEST_FINISHES_SYSTEM_PROP_KEY =
         "StreamingAsyncHttpClient.debug.shouldLogBadMessagesAfterRequestFinishes";
@@ -138,36 +139,212 @@ public class StreamingAsyncHttpClient {
 
     public static class StreamingChannel {
 
-        private final Channel channel;
-        private final ChannelPool pool;
-        private final ObjectHolder<Boolean> callActiveHolder;
+        protected final Channel channel;
+        protected final ChannelPool pool;
+        protected final ObjectHolder<Boolean> callActiveHolder;
+        protected final ObjectHolder<Boolean> downstreamLastChunkSentHolder;
+        protected final Deque<Span> distributedTracingSpanStack;
+        protected final Map<String, String> distributedTracingMdcInfo;
+        protected boolean channelClosedDueToUnrecoverableError = false;
+        private boolean alreadyLoggedMessageAboutIgnoringCloseDueToError = false;
 
-        StreamingChannel(Channel channel, ChannelPool pool, ObjectHolder<Boolean> callActiveHolder) {
+        StreamingChannel(Channel channel,
+                         ChannelPool pool,
+                         ObjectHolder<Boolean> callActiveHolder,
+                         ObjectHolder<Boolean> downstreamLastChunkSentHolder,
+                         Deque<Span> distributedTracingSpanStack,
+                         Map<String, String> distributedTracingMdcInfo) {
             this.channel = channel;
             this.pool = pool;
             this.callActiveHolder = callActiveHolder;
+            this.downstreamLastChunkSentHolder = downstreamLastChunkSentHolder;
+            this.distributedTracingSpanStack = distributedTracingSpanStack;
+            this.distributedTracingMdcInfo = distributedTracingMdcInfo;
         }
 
-        public ChannelFuture streamChunks(HttpContent... chunksToWrite) {
-            ChannelFuture lastChunkFuture = null;
-            for (HttpContent chunk : chunksToWrite) {
-                lastChunkFuture = channel.write(chunk);
+        /**
+         * Calls {@link Channel#writeAndFlush(Object)} to pass the given chunk to the downstream system. Note that
+         * the flush will cause the reference count of the given chunk to decrease by 1. If any error occurs that
+         * prevents the {@link Channel#writeAndFlush(Object)} call from executing (e.g. {@link
+         * #channelClosedDueToUnrecoverableError} was called previously) then {@link HttpContent#release()} will
+         * be called manually so that you can rely on the given chunk's reference count always being reduced by 1
+         * at some point after calling this method.
+         *
+         * @param chunkToWrite The chunk to send downstream.
+         * @return The {@link ChannelFuture} that will tell you if the write succeeded.
+         */
+        public ChannelFuture streamChunk(HttpContent chunkToWrite) {
+            try {
+                ChannelPromise result = channel.newPromise();
+
+                channel.eventLoop().execute(
+                    () -> doStreamChunk(chunkToWrite).addListener(future -> {
+                        if (future.isCancelled()) {
+                            result.cancel(true);
+                        }
+                        else if (future.isSuccess()) {
+                            result.setSuccess();
+                        }
+                        else if (future.cause() != null) {
+                            result.setFailure(future.cause());
+                        }
+                        else {
+                            runnableWithTracingAndMdc(
+                                () -> logger.error(
+                                    "Found a future with no result. This should not be possible. Failing the future. "
+                                    + "future_done={}, future_success={}, future_cancelled={}, future_failure_cause={}",
+                                    future.isDone(), future.isSuccess(), future.isCancelled(), future.cause()
+                                ),
+                                distributedTracingSpanStack, distributedTracingMdcInfo
+                            ).run();
+                            result.setFailure(
+                                new RuntimeException("Received ChannelFuture that was in an impossible state")
+                            );
+                        }
+                    })
+                );
+
+                return result;
             }
+            catch(Throwable t) {
+                String errorMsg =
+                    "StreamingChannel.streamChunk() threw an exception. This should not be possible and indicates "
+                    + "something went wrong with a Netty write() and flush(). If you see Netty memory leak warnings "
+                    + "then this could be why. Please report this along with the stack trace to "
+                    + "https://github.com/Nike-Inc/riposte/issues/new";
 
-            channel.flush();
+                Exception exceptionToPass = new RuntimeException(errorMsg, t);
 
-            return lastChunkFuture;
+                logger.error(errorMsg, exceptionToPass);
+                return channel.newFailedFuture(exceptionToPass);
+            }
         }
 
-        public void closeChannelDueToUnrecoverableError() {
-            // Mark the channel as broken so it will be closed and removed from the pool when it is returned.
-            markChannelAsBroken(channel);
+        protected ChannelFuture doStreamChunk(HttpContent chunkToWrite) {
+            // We are in the channel's event loop. Do some final checks to make sure it's still ok to write and flush
+            //      the message, then do it (or handle the special cases appropriately).
+            try {
+                if (downstreamLastChunkSentHolder.heldObject
+                    && (chunkToWrite instanceof LastHttpContent)
+                    && chunkToWrite.content().readableBytes() == 0
+                    ) {
+                    // A LastHttpContent has already been written downstream. This is valid/legal when the downstream call
+                    //      has a content-length header, and the downstream pipeline encoder realizes there's no more
+                    //      content to write and generates a synthetic empty LastHttpContent rather than waiting for this
+                    //      one to arrive. Therefore there's nothing to do but release the content chunk and return an
+                    //      already-successfully-completed future.
+                    if (logger.isDebugEnabled()) {
+                        runnableWithTracingAndMdc(
+                            () -> logger.warn("Ignoring zero-length LastHttpContent from upstream, because a "
+                                              + "LastHttpContent has already been sent downstream."),
+                            distributedTracingSpanStack, distributedTracingMdcInfo
+                        ).run();
+                    }
+                    chunkToWrite.release();
+                    return channel.newSucceededFuture();
+                }
 
-            // Release it back to the pool if possible/necessary so the pool can do its usual cleanup.
-            releaseChannelBackToPoolIfCallIsActive(channel, pool, callActiveHolder);
+                if (!callActiveHolder.heldObject) {
+                    chunkToWrite.release();
+                    return channel.newFailedFuture(
+                        new RuntimeException("Unable to stream chunk - downstream call is no longer active.")
+                    );
+                }
 
-            // No matter what the cause is we want to make sure the channel is closed.
-            channel.close();
+                if (channelClosedDueToUnrecoverableError) {
+                    chunkToWrite.release();
+                    return channel.newFailedFuture(
+                        new RuntimeException("Unable to stream chunks downstream - the channel was closed previously "
+                                             + "due to an unrecoverable error")
+                    );
+                }
+
+                return channel.writeAndFlush(chunkToWrite);
+            }
+            catch(Throwable t) {
+                String errorMsg =
+                    "StreamingChannel.doStreamChunk() threw an exception. This should not be possible and indicates "
+                    + "something went wrong with a Netty write() and flush(). If you see Netty memory leak warnings "
+                    + "then this could be why. Please report this along with the stack trace to "
+                    + "https://github.com/Nike-Inc/riposte/issues/new";
+
+                Exception exceptionToPass = new RuntimeException(errorMsg, t);
+
+                logger.error(errorMsg, exceptionToPass);
+                return channel.newFailedFuture(exceptionToPass);
+            }
+        }
+
+        private static final Logger logger = LoggerFactory.getLogger(StreamingChannel.class);
+
+        public Channel getChannel() {
+            return channel;
+        }
+
+        public boolean isDownstreamCallActive() {
+            return callActiveHolder.heldObject;
+        }
+
+        public void closeChannelDueToUnrecoverableError(Throwable cause) {
+            try {
+                // Ignore subsequent calls to this method, and only try to do something if the call is still active.
+                //      If the call is *not* active, then everything has already been cleaned up and we shouldn't
+                //      do anything because the channel might have already been handed out for a different call.
+                if (!channelClosedDueToUnrecoverableError && callActiveHolder.heldObject) {
+                    // Schedule the close on the channel's event loop.
+                    channel.eventLoop().execute(() -> doCloseChannelDueToUnrecoverableError(cause));
+                    return;
+                }
+
+                if (!alreadyLoggedMessageAboutIgnoringCloseDueToError && logger.isDebugEnabled()) {
+                    runnableWithTracingAndMdc(
+                        () -> logger.debug(
+                            "Ignoring calls to StreamingChannel.closeChannelDueToUnrecoverableError() because it "
+                            + "has already been called, or the call is no longer active. "
+                            + "previously_called={}, call_is_active={}",
+                            channelClosedDueToUnrecoverableError, callActiveHolder.heldObject
+                        ),
+                        distributedTracingSpanStack, distributedTracingMdcInfo
+                    ).run();
+                }
+
+                alreadyLoggedMessageAboutIgnoringCloseDueToError = true;
+            }
+            finally {
+                channelClosedDueToUnrecoverableError = true;
+            }
+        }
+
+        protected void doCloseChannelDueToUnrecoverableError(Throwable cause) {
+            // We should now be in the channel's event loop. Do a final check to make sure the call is still active
+            //      since it could have closed while we were waiting to run on the event loop.
+            if (callActiveHolder.heldObject) {
+                runnableWithTracingAndMdc(
+                    () -> logger.error("Closing StreamingChannel due to unrecoverable error. "
+                                       + "channel_id={}, unrecoverable_error={}",
+                                       channel.toString(), String.valueOf(cause)
+                    ),
+                    distributedTracingSpanStack, distributedTracingMdcInfo
+                ).run();
+
+                // Mark the channel as broken so it will be closed and removed from the pool when it is returned.
+                markChannelAsBroken(channel);
+
+                // Release it back to the pool if possible/necessary so the pool can do its usual cleanup.
+                releaseChannelBackToPoolIfCallIsActive(
+                    channel, pool, callActiveHolder,
+                    "closing StreamingChannel due to unrecoverable error: " + String.valueOf(cause),
+                    distributedTracingSpanStack, distributedTracingMdcInfo
+                );
+
+                // No matter what the cause is we want to make sure the channel is closed.
+                channel.close();
+            }
+            else {
+                logger.debug("The call deactivated before we could close the StreamingChannel. Therefore there's "
+                             + "nothing to do for this unrecoverable error as any necessary cleanup has already been "
+                             + "done. ignored_unrecoverable_error={}", cause.toString());
+            }
         }
     }
 
@@ -175,7 +352,9 @@ public class StreamingAsyncHttpClient {
 
         void messageReceived(HttpObject msg);
 
-        void unrecoverableErrorOccurred(Throwable error);
+        void unrecoverableErrorOccurred(Throwable error, boolean guaranteesBrokenDownstreamResponse);
+
+        void cancelStreamingToOriginalCaller();
     }
 
     /**
@@ -407,16 +586,20 @@ public class StreamingAsyncHttpClient {
     public CompletableFuture<StreamingChannel> streamDownstreamCall(
         String downstreamHost, int downstreamPort, HttpRequest initialRequestChunk, boolean isSecureHttpsCall,
         boolean relaxedHttpsValidation, StreamingCallback callback, long downstreamCallTimeoutMillis,
+        boolean performSubSpanAroundDownstreamCalls, boolean addTracingHeadersToDownstreamCall,
         ChannelHandlerContext ctx
     ) {
         CompletableFuture<StreamingChannel> streamingChannel = new CompletableFuture<>();
 
-        initialRequestChunk.headers().set(HttpHeaders.Names.HOST, downstreamHost);
+        // set host header. include port in value when it is a non-default port
+        boolean isDefaultPort = (downstreamPort == 80 && !isSecureHttpsCall)
+                             || (downstreamPort == 443 && isSecureHttpsCall);
+        String hostHeaderValue = (isDefaultPort)
+                                 ? downstreamHost
+                                 : downstreamHost + ":" + downstreamPort;
+        initialRequestChunk.headers().set(HttpHeaders.Names.HOST, hostHeaderValue);
 
-        boolean performSubSpanAroundDownstreamCalls = true;
-
-        ObjectHolder<Long> beforeConnectionStartTimeNanos = new ObjectHolder<>();
-        beforeConnectionStartTimeNanos.heldObject = System.nanoTime();
+        long beforeConnectionStartTimeNanos = System.nanoTime();
 
         // Create a connection to the downstream server.
         ChannelPool pool = getPooledChannelFuture(downstreamHost, downstreamPort);
@@ -425,8 +608,22 @@ public class StreamingAsyncHttpClient {
         channelFuture.addListener(future -> {
             Pair<Deque<Span>, Map<String, String>> originalThreadInfo = null;
             try {
+                long connectionSetupTimeNanos = System.nanoTime() - beforeConnectionStartTimeNanos;
+                HttpProcessingState httpProcessingState = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
+                if (httpProcessingState != null) {
+                    RequestInfo<?> requestInfo = httpProcessingState.getRequestInfo();
+                    if (requestInfo != null) {
+                        requestInfo.addRequestAttribute(DOWNSTREAM_CALL_CONNECTION_SETUP_TIME_NANOS_REQUEST_ATTR_KEY,
+                                                        connectionSetupTimeNanos);
+                    }
+                }
+
                 // Setup tracing and MDC so our log messages have the correct distributed trace info, etc.
                 originalThreadInfo = linkTracingAndMdcToCurrentThread(ctx);
+
+                if (logger.isDebugEnabled()) {
+                    logger.debug("CONNECTION SETUP TIME NANOS: {}", connectionSetupTimeNanos);
+                }
 
                 if (!future.isSuccess()) {
                     try {
@@ -450,14 +647,7 @@ public class StreamingAsyncHttpClient {
                     return;
                 }
 
-                if (logger.isDebugEnabled()) {
-                    logger.debug("CONNECTION SETUP TIME NANOS: {}",
-                                 (System.nanoTime() - beforeConnectionStartTimeNanos.heldObject)
-                    );
-                }
-
                 // Do a subspan around the downstream call if desired.
-                Span currentSpan = Tracer.getInstance().getCurrentSpan();
                 //noinspection ConstantConditions
                 if (performSubSpanAroundDownstreamCalls) {
                     // Add the subspan.
@@ -465,7 +655,7 @@ public class StreamingAsyncHttpClient {
                         initialRequestChunk.getMethod().name(),
                         downstreamHost + ":" + downstreamPort + initialRequestChunk.getUri()
                     );
-                    if (currentSpan == null) {
+                    if (Tracer.getInstance().getCurrentSpan() == null) {
                         // There is no parent span to start a subspan from, so we have to start a new span for this call
                         //      rather than a subspan.
                         // TODO: Set this to CLIENT once we have that ability in the wingtips API for request root spans
@@ -480,21 +670,21 @@ public class StreamingAsyncHttpClient {
                 Deque<Span> distributedSpanStackToUse = Tracer.getInstance().getCurrentSpanStackCopy();
                 Map<String, String> mdcContextToUse = MDC.getCopyOfContextMap();
 
-                // Add distributed trace headers to the downstream call if we have a current span.
-                if (currentSpan != null) {
-                    setHeaderIfValueNotNull(initialRequestChunk, TraceHeaders.TRACE_SAMPLED,
-                                            String.valueOf(currentSpan.isSampleable()));
-                    setHeaderIfValueNotNull(initialRequestChunk, TraceHeaders.TRACE_ID, currentSpan.getTraceId());
-                    setHeaderIfValueNotNull(initialRequestChunk, TraceHeaders.SPAN_ID, currentSpan.getSpanId());
-                    setHeaderIfValueNotNull(initialRequestChunk, TraceHeaders.PARENT_SPAN_ID,
-                                            currentSpan.getParentSpanId());
-                    setHeaderIfValueNotNull(initialRequestChunk, TraceHeaders.SPAN_NAME, currentSpan.getSpanName());
-                }
+                Span spanForDownstreamCall = (distributedSpanStackToUse == null)
+                                             ? null
+                                             : distributedSpanStackToUse.peek();
 
-                // Remove any content-length header and set the transfer-encoding to chunked
-                //      since we're sending in chunks.
-                initialRequestChunk.headers().remove(CONTENT_LENGTH);
-                initialRequestChunk.headers().set(TRANSFER_ENCODING, CHUNKED);
+                // Add distributed trace headers to the downstream call if desired and we have a current span.
+                if (addTracingHeadersToDownstreamCall && spanForDownstreamCall != null) {
+                    HttpRequestTracingUtils.propagateTracingHeaders(
+                        (headerKey, headerValue) -> {
+                            if (headerValue != null) {
+                                initialRequestChunk.headers().set(headerKey, headerValue);
+                            }
+                        },
+                        spanForDownstreamCall
+                    );
+                }
 
                 Channel ch = channelFuture.getNow();
                 if (logger.isDebugEnabled())
@@ -519,11 +709,13 @@ public class StreamingAsyncHttpClient {
                     try {
                         ObjectHolder<Boolean> callActiveHolder = new ObjectHolder<>();
                         callActiveHolder.heldObject = true;
+                        ObjectHolder<Boolean> lastChunkSentDownstreamHolder = new ObjectHolder<>();
+                        lastChunkSentDownstreamHolder.heldObject = false;
                         //noinspection ConstantConditions
                         prepChannelForDownstreamCall(
                             pool, ch, callback, distributedSpanStackToUse, mdcContextToUse, isSecureHttpsCall,
                             relaxedHttpsValidation, performSubSpanAroundDownstreamCalls, downstreamCallTimeoutMillis,
-                            callActiveHolder
+                            callActiveHolder, lastChunkSentDownstreamHolder
                         );
 
                         logInitialRequestChunk(initialRequestChunk, downstreamHost, downstreamPort);
@@ -535,7 +727,10 @@ public class StreamingAsyncHttpClient {
                         //      for any further chunk streaming
                         writeFuture.addListener(completedWriteFuture -> {
                             if (completedWriteFuture.isSuccess())
-                                streamingChannel.complete(new StreamingChannel(ch, pool, callActiveHolder));
+                                streamingChannel.complete(new StreamingChannel(
+                                    ch, pool, callActiveHolder, lastChunkSentDownstreamHolder,
+                                    distributedSpanStackToUse, mdcContextToUse
+                                ));
                             else {
                                 prepChannelErrorHandler.accept(
                                     "Writing the first HttpRequest chunk to the downstream service failed.",
@@ -566,7 +761,7 @@ public class StreamingAsyncHttpClient {
                 try {
                     String errorMsg = "Error occurred attempting to send first chunk (headers/etc) downstream";
                     Exception errorToFire = new WrapperException(errorMsg, ex);
-                    logger.error(errorMsg, errorToFire);
+                    logger.warn(errorMsg, errorToFire);
                     streamingChannel.completeExceptionally(errorToFire);
                 }
                 finally {
@@ -592,7 +787,7 @@ public class StreamingAsyncHttpClient {
         ChannelPool pool, Channel ch, StreamingCallback callback, Deque<Span> distributedSpanStackToUse,
         Map<String, String> mdcContextToUse, boolean isSecureHttpsCall, boolean relaxedHttpsValidation,
         boolean performSubSpanAroundDownstreamCalls, long downstreamCallTimeoutMillis,
-        ObjectHolder<Boolean> callActiveHolder
+        ObjectHolder<Boolean> callActiveHolder, ObjectHolder<Boolean> lastChunkSentDownstreamHolder
     ) throws SSLException, NoSuchAlgorithmException, KeyStoreException {
 
         ChannelHandler chunkSenderHandler = new SimpleChannelInboundHandler<HttpObject>() {
@@ -602,17 +797,21 @@ public class StreamingAsyncHttpClient {
                     // Only do the distributed trace and callback work if the call is active. Messages that pop up after
                     //      the call is fully processed should not trigger the behavior a second time.
                     if (callActiveHolder.heldObject) {
-                        if (msg instanceof LastHttpContent && performSubSpanAroundDownstreamCalls) {
-                            // Complete the subspan.
-                            runnableWithTracingAndMdc(
-                                () -> {
-                                    if (distributedSpanStackToUse == null || distributedSpanStackToUse.size() < 2)
-                                        Tracer.getInstance().completeRequestSpan();
-                                    else
-                                        Tracer.getInstance().completeSubSpan();
-                                },
-                                distributedSpanStackToUse, mdcContextToUse
-                            ).run();
+                        if (msg instanceof LastHttpContent) {
+                            lastChunkSentDownstreamHolder.heldObject = true;
+
+                            if (performSubSpanAroundDownstreamCalls) {
+                                // Complete the subspan.
+                                runnableWithTracingAndMdc(
+                                    () -> {
+                                        if (distributedSpanStackToUse == null || distributedSpanStackToUse.size() < 2)
+                                            Tracer.getInstance().completeRequestSpan();
+                                        else
+                                            Tracer.getInstance().completeSubSpan();
+                                    },
+                                    distributedSpanStackToUse, mdcContextToUse
+                                ).run();
+                            }
                         }
 
                         HttpObject msgToPass = msg;
@@ -649,8 +848,10 @@ public class StreamingAsyncHttpClient {
                     }
                 }
                 finally {
-                    if (msg instanceof LastHttpContent)
-                        releaseChannelBackToPoolIfCallIsActive(ch, pool, callActiveHolder);
+                    if (msg instanceof LastHttpContent) {
+                        releaseChannelBackToPoolIfCallIsActive(ch, pool, callActiveHolder, "last content chunk sent",
+                                                               distributedSpanStackToUse, mdcContextToUse);
+                    }
                 }
             }
         };
@@ -685,7 +886,7 @@ public class StreamingAsyncHttpClient {
                         );
                     }
 
-                    callback.unrecoverableErrorOccurred(cause);
+                    callback.unrecoverableErrorOccurred(cause, true);
                 }
                 else {
                     if (cause instanceof DownstreamIdleChannelTimeoutException) {
@@ -706,7 +907,10 @@ public class StreamingAsyncHttpClient {
                 markChannelAsBroken(ch);
 
                 // Release it back to the pool if possible/necessary so the pool can do its usual cleanup.
-                releaseChannelBackToPoolIfCallIsActive(ch, pool, callActiveHolder);
+                releaseChannelBackToPoolIfCallIsActive(
+                    ch, pool, callActiveHolder, "error received in downstream pipeline: " + cause.toString(),
+                    distributedSpanStackToUse, mdcContextToUse
+                );
 
                 // No matter what the cause is we want to make sure the channel is closed. Doing this raw ch.close()
                 //      here will catch the cases where this channel does not have an active call but still needs to be
@@ -726,6 +930,17 @@ public class StreamingAsyncHttpClient {
 
             @Override
             public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+                if (logger.isDebugEnabled()) {
+                    runnableWithTracingAndMdc(
+                        () -> logger.debug(
+                            "Downstream channel closing. call_active={}, last_chunk_sent_downstream={}, channel_id={}",
+                            callActiveHolder.heldObject, lastChunkSentDownstreamHolder.heldObject,
+                            ctx.channel().toString()
+                        ),
+                        distributedSpanStackToUse, mdcContextToUse
+                    ).run();
+                }
+
                 // We only care if the channel was closed while the call was active.
                 if (callActiveHolder.heldObject)
                     doErrorHandlingConsumer.accept(new DownstreamChannelClosedUnexpectedlyException(ch));
@@ -798,19 +1013,25 @@ public class StreamingAsyncHttpClient {
             HttpClientCodec currentCodec = (HttpClientCodec) p.get(HTTP_CLIENT_CODEC_HANDLER_NAME);
             int currentHttpClientCodecInboundState = determineHttpClientCodecInboundState(currentCodec);
             if (currentHttpClientCodecInboundState != 0) {
-                logger.warn(
-                    "HttpClientCodec inbound state was not 0. It will be replaced with a fresh HttpClientCodec. "
-                    + "bad_httpclientcodec_inbound_state={}", currentHttpClientCodecInboundState
-                );
+                runnableWithTracingAndMdc(
+                    () -> logger.warn(
+                        "HttpClientCodec inbound state was not 0. It will be replaced with a fresh HttpClientCodec. "
+                        + "bad_httpclientcodec_inbound_state={}", currentHttpClientCodecInboundState
+                    ),
+                    distributedSpanStackToUse, mdcContextToUse
+                ).run();
                 existingHttpClientCodecIsInBadState = true;
             }
             else {
                 int currentHttpClientCodecOutboundState = determineHttpClientCodecOutboundState(currentCodec);
                 if (currentHttpClientCodecOutboundState != 0) {
-                    logger.warn(
-                        "HttpClientCodec outbound state was not 0. It will be replaced with a fresh HttpClientCodec. "
-                        + "bad_httpclientcodec_outbound_state={}", currentHttpClientCodecOutboundState
-                    );
+                    runnableWithTracingAndMdc(
+                        () -> logger.warn(
+                            "HttpClientCodec outbound state was not 0. It will be replaced with a fresh HttpClientCodec. "
+                            + "bad_httpclientcodec_outbound_state={}", currentHttpClientCodecOutboundState
+                        ),
+                        distributedSpanStackToUse, mdcContextToUse
+                    ).run();
                     existingHttpClientCodecIsInBadState = true;
                 }
             }
@@ -903,8 +1124,9 @@ public class StreamingAsyncHttpClient {
                 boolean channelAlreadyBroken = channelIsMarkedAsBeingBroken(ch);
                 logger.warn(
                     "HttpClientCodec inbound state was not 0. The channel will be marked as broken so it won't be "
-                    + "used. bad_httpclientcodec_inbound_state={}, channel_already_broken={}, call_context=\"{}\"",
-                    currentHttpClientCodecInboundState, channelAlreadyBroken, callContextForLogs
+                    + "used. bad_httpclientcodec_inbound_state={}, channel_already_broken={}, channel_id={}, "
+                    + "call_context=\"{}\"",
+                    currentHttpClientCodecInboundState, channelAlreadyBroken, ch.toString(), callContextForLogs
                 );
                 markChannelAsBroken(ch);
             }
@@ -914,8 +1136,9 @@ public class StreamingAsyncHttpClient {
                     boolean channelAlreadyBroken = channelIsMarkedAsBeingBroken(ch);
                     logger.warn(
                         "HttpClientCodec outbound state was not 0. The channel will be marked as broken so it won't be "
-                        + "used. bad_httpclientcodec_outbound_state={}, channel_already_broken={}, call_context=\"{}\"",
-                        currentHttpClientCodecOutboundState, channelAlreadyBroken, callContextForLogs
+                        + "used. bad_httpclientcodec_outbound_state={}, channel_already_broken={}, channel_id={}, "
+                        + "call_context=\"{}\"",
+                        currentHttpClientCodecOutboundState, channelAlreadyBroken, ch.toString(), callContextForLogs
                     );
                     markChannelAsBroken(ch);
                 }
@@ -932,16 +1155,24 @@ public class StreamingAsyncHttpClient {
     }
 
     protected static void releaseChannelBackToPoolIfCallIsActive(Channel ch, ChannelPool pool,
-                                                                 ObjectHolder<Boolean> callActiveHolder) {
+                                                                 ObjectHolder<Boolean> callActiveHolder,
+                                                                 String contextReason,
+                                                                 Deque<Span> distributedTracingStack,
+                                                                 Map<String, String> distributedTracingMdcInfo) {
         if (callActiveHolder.heldObject) {
+            if (logger.isDebugEnabled()) {
+                runnableWithTracingAndMdc(
+                    () -> logger.debug(
+                        "Marking call as inactive and releasing channel back to pool. "
+                        + "channel_release_reason=\"{}\"", contextReason
+                    ),
+                    distributedTracingStack, distributedTracingMdcInfo
+                ).run();
+            }
+
             callActiveHolder.heldObject = false;
             pool.release(ch);
         }
-    }
-
-    protected void setHeaderIfValueNotNull(HttpMessage httpMessage, String key, String value) {
-        if (value != null)
-            httpMessage.headers().set(key, value);
     }
 
     /**
@@ -951,7 +1182,7 @@ public class StreamingAsyncHttpClient {
         return "async_downstream_call-" + httpMethod + "_" + url;
     }
 
-    private static class ObjectHolder<T> {
+    protected static class ObjectHolder<T> {
         public T heldObject;
     }
 }

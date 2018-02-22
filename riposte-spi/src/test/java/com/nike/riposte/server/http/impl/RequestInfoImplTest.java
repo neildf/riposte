@@ -4,7 +4,6 @@ import com.nike.internal.util.Pair;
 import com.nike.riposte.server.error.exception.PathParameterMatchingException;
 import com.nike.riposte.server.error.exception.RequestContentDeserializationException;
 import com.nike.riposte.server.http.RequestInfo;
-import com.nike.riposte.util.HttpUtils;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -12,6 +11,7 @@ import com.google.common.collect.Sets;
 import com.tngtech.java.junit.dataprovider.DataProvider;
 import com.tngtech.java.junit.dataprovider.DataProviderRunner;
 
+import org.assertj.core.api.Assertions;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.mockito.internal.util.reflection.Whitebox;
@@ -448,6 +448,7 @@ public class RequestInfoImplTest {
         assertThat(requestInfo.getPathParam("param2"), is(expectedParam2));
         assertThat(requestInfo.getPathParams().get("param1"), is(expectedParam1));
         assertThat(requestInfo.getPathParams().get("param2"), is(expectedParam2));
+        assertThat(requestInfo.getPathTemplate(), is(pathTemplate));
     }
 
     @Test(expected = PathParameterMatchingException.class)
@@ -489,6 +490,27 @@ public class RequestInfoImplTest {
         // then
         assertThat(requestInfo.getPathParams(), notNullValue());
         assertThat(requestInfo.getPathParams().isEmpty(), is(true));
+    }
+
+    @DataProvider(value = {
+        "0",
+        "42"
+    })
+    @Test
+    public void contentChunksWillBeReleasedExternally_works_as_expected(int contentChunkListSize) {
+        // given
+        RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
+        Assertions.assertThat(requestInfo.contentChunksWillBeReleasedExternally).isFalse();
+        for (int i = 0; i < contentChunkListSize; i++) {
+            requestInfo.contentChunks.add(mock(HttpContent.class));
+        }
+
+        // when
+        requestInfo.contentChunksWillBeReleasedExternally();
+
+        // then
+        Assertions.assertThat(requestInfo.contentChunksWillBeReleasedExternally).isTrue();
+        Assertions.assertThat(requestInfo.contentChunks).isEmpty();
     }
 
     @Test(expected = IllegalStateException.class)
@@ -636,6 +658,37 @@ public class RequestInfoImplTest {
         assertThat(requestInfo.trailingHeaders, is(lastChunk.trailingHeaders()));
     }
 
+    @Test
+    public void addContentChunk_does_not_add_chunk_to_contentChunks_list_if_contentChunksWillBeReleasedExternally_is_true() {
+        // given
+        RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
+        requestInfo.isCompleteRequestWithAllChunks = false;
+        requestInfo.contentChunksWillBeReleasedExternally();
+        HttpContent chunk = new DefaultHttpContent(Unpooled.copiedBuffer(UUID.randomUUID().toString(), CharsetUtil.UTF_8));
+
+        // when
+        requestInfo.addContentChunk(chunk);
+
+        // then
+        Assertions.assertThat(requestInfo.contentChunks).isEmpty();
+    }
+
+    @Test
+    public void addContentChunk_does_not_set_isCompleteRequestWithAllChunks_to_true_if_contentChunksWillBeReleasedExternally_is_true() {
+        // given
+        RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
+        requestInfo.isCompleteRequestWithAllChunks = false;
+        requestInfo.contentChunksWillBeReleasedExternally();
+        LastHttpContent lastChunk = new DefaultLastHttpContent(Unpooled.copiedBuffer(UUID.randomUUID().toString(), CharsetUtil.UTF_8));
+
+        // when
+        requestInfo.addContentChunk(lastChunk);
+
+        // then
+        Assertions.assertThat(requestInfo.isCompleteRequestWithAllChunks()).isFalse();
+        Assertions.assertThat(requestInfo.contentChunks).isEmpty();
+    }
+
     private static final String KNOWN_MULTIPART_DATA_CONTENT_TYPE_HEADER = "multipart/form-data; boundary=OnbiRR2K8-ZzW3rj0wLh_r9td9w_XD34jBR";
     private static final String KNOWN_MULTIPART_DATA_NAME = "someFile";
     private static final String KNOWN_MULTIPART_DATA_FILENAME = "someFile.txt";
@@ -781,6 +834,25 @@ public class RequestInfoImplTest {
     }
 
     @Test
+    public void releaseContentChunks_clear_on_chunk_list_but_does_not_release_chunks_if_contentChunksWillBeReleasedExternally_is_true() {
+        // given
+        RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
+        requestInfo.contentChunksWillBeReleasedExternally();
+        List<HttpContent> contentChunkList = Arrays.asList(mock(HttpContent.class), mock(HttpContent.class));
+        requestInfo.contentChunks.addAll(contentChunkList);
+        assertThat(requestInfo.contentChunks.size(), is(contentChunkList.size()));
+
+        // when
+        requestInfo.releaseContentChunks();
+
+        // then
+        for (HttpContent chunkMock : contentChunkList) {
+            verify(chunkMock, never()).release();
+        }
+        assertThat(requestInfo.contentChunks.isEmpty(), is(true));
+    }
+
+    @Test
     public void releaseMultipartData_works_as_expected_and_does_nothing_on_subsequent_calls() {
         // given
         RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
@@ -841,6 +913,18 @@ public class RequestInfoImplTest {
 
         // then
         assertThat(requestInfo.getRequestAttributes().get(attributeName), is(attributeValue));
+    }
+
+    @Test
+    public void getPathTemplate_returns_empty_string_when_null_value() {
+        // given
+        RequestInfoImpl<?> requestInfo = RequestInfoImpl.dummyInstanceForUnknownRequests();
+
+        // when
+        String pathTemplate = requestInfo.getPathTemplate();
+
+        // then
+        assertThat(pathTemplate, is(""));
     }
 
     public static class TestContentObject {

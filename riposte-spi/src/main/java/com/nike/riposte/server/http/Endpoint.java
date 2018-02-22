@@ -1,6 +1,7 @@
 package com.nike.riposte.server.http;
 
 import com.nike.riposte.server.config.ServerConfig;
+import com.nike.riposte.server.error.exception.MissingRequiredContentException;
 import com.nike.riposte.util.Matcher;
 
 import com.fasterxml.jackson.core.type.TypeReference;
@@ -75,6 +76,19 @@ public interface Endpoint<I> {
     }
 
     /**
+     * @return true if this endpoint wants validation on the {@link RequestInfo#getContent()} to ensure it always has
+     * content. If this returns true and there was no content passed,
+     * {@link MissingRequiredContentException} will be thrown,
+     * which is mapped to an appropriate HTTP status code 400 error response by the default riposte exception handler
+     * <p>
+     * By default this will return false when {@link #requestContentType()} is null or {@link Void} type (indicating you don't expect any content), true otherwise.
+     */
+    default boolean isRequireRequestContent() {
+        TypeReference<I> requestContentType = requestContentType();
+        return requestContentType != null && !Void.class.equals(requestContentType.getType());
+    }
+
+    /**
      * @return true if this endpoint knows that deserializing and validating the payload in the given request is fast
      * enough that it will finish processing in less than half a millisecond or so (and therefore not block Netty worker
      * threads to the point it becomes a bottleneck and adversely affects throughput), false otherwise when
@@ -117,4 +131,28 @@ public interface Endpoint<I> {
         return null;
     }
 
+    /**
+     * @return The max request size in bytes that you want to allow for this specific endpoint, or null if you want to
+     * use the app-wide default max request size returned by {@link ServerConfig#maxRequestSizeInBytes()}.
+     *
+     * If you would like to disable validation on this endpoint, return 0 or less.
+     *
+     * If you would like to default to the global configured limit, return null.
+     */
+    default Integer maxRequestSizeInBytesOverride() {
+        // Return null by default so that the app-wide max request size will be used unless you override this method.
+        return null;
+    }
+
+    /**
+     * @return true if this endpoint should automatically decompress gzip/deflate encoded payloads (when the
+     * Content-Encoding header is "gzip" or "deflate"), false if the endpoint should pass compressed payloads on to the
+     * endpoint unchanged (where you can access the raw bytes by calling {@link RequestInfo#getRawContentBytes()}).
+     * Note that this method is called before any of the payload has arrived, so {@link
+     * RequestInfo#isCompleteRequestWithAllChunks()} will return false for the given request and all of the
+     * get-content-related methods in the request will return null.
+     */
+    default boolean isDecompressRequestPayloadAllowed(@SuppressWarnings("unused") RequestInfo<?> request) {
+        return true;
+    }
 }

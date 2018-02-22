@@ -43,6 +43,8 @@ public interface RequestInfo<T> {
      * The full URI associated with this request. This will be the raw, potentially encoded, value sent to the server.
      * It may include the query string (use {@link #getPath()} if you don't want the query string).
      *
+     * see {@link #getPathTemplate()} if you are looking for the matching template of the request
+     *
      * Will never be null - the empty string will be used if no URI information was provided.
      */
     public String getUri();
@@ -52,6 +54,8 @@ public interface RequestInfo<T> {
      * query string).
      *
      * The path value returned will be URL decoded before being returned.
+     *
+     * see {@link #getPathTemplate()} if you are looking for the matching template of the request
      *
      * Will never be null - the empty string will be used if no path information could be extracted.
      */
@@ -292,18 +296,18 @@ public interface RequestInfo<T> {
     public boolean isKeepAliveRequested();
 
     /**
-     * Adds the given content chunk to the list of chunks this instance is tracking. When this method detects that the
-     * passed-in chunk is the last chunk in the request it will mark this request so that {@link
-     * #isCompleteRequestWithAllChunks()} will return true. Once this is done, the first subsequent call to {@link
-     * #getRawContentBytes()} will convert all the chunks into a byte array and return it from then on. This
-     * lazy-loading style protects us from loading the bytes and (very temporarily) doubling the memory necessary to
-     * store it in the case that the request never causes {@link #getRawContentBytes()} to be called. NOTE: Calling
-     * {@link #getRawContent()} is even worse memory-wise since it converts the bytes into a string and caches the
-     * result. This is also true for {@link #getContent()}, however raw bytes are usually not useful and endpoints need
-     * to inspect the data somehow, so the utility of the deserialized object usually pushes users in favor of {@link
-     * #getContent()} rather than {@link #getRawContent()}. Just understand that those methods are lazy-loading, so if
-     * you don't need to call {@link #getRawContent()} or {@link #getContent()} (or both) then you can save some memory
-     * while the endpoint is executing.
+     * Adds the given content chunk to the list of chunks this instance is tracking and returns current request size
+     * in bytes after adding this chunk. When this method detects that the passed-in chunk is the last chunk in the
+     * request it will mark this request so that {@link #isCompleteRequestWithAllChunks()} will return true.
+     * Once this is done, the first subsequent call to {@link #getRawContentBytes()} will convert all the chunks into
+     * a byte array and return it from then on. This lazy-loading style protects us from loading the bytes and
+     * (very temporarily) doubling the memory necessary to store it in the case that the request never causes
+     * {@link #getRawContentBytes()} to be called. NOTE: Calling {@link #getRawContent()} is even worse memory-wise
+     * since it converts the bytes into a string and caches the result. This is also true for {@link #getContent()},
+     * however raw bytes are usually not useful and endpoints need to inspect the data somehow, so the utility of the
+     * deserialized object usually pushes users in favor of {@link #getContent()} rather than {@link #getRawContent()}.
+     * Just understand that those methods are lazy-loading, so if you don't need to call {@link #getRawContent()} or
+     * {@link #getContent()} (or both) then you can save some memory while the endpoint is executing.
      * <p/>
      * When the last chunk is detected this method will also set {@link #getTrailingHeaders()} to whatever trailing
      * headers were contained in the last chunk.
@@ -320,7 +324,7 @@ public interface RequestInfo<T> {
      * final chunk being added or in the case that the request never causes {@link #getRawContentBytes()} to be called.
      * Individual endpoints do not need to worry about this issue - it's a problem for the server to solve.
      */
-    public void addContentChunk(HttpContent chunk);
+    public int addContentChunk(HttpContent chunk);
 
     /**
      * Returns true if this request represents a 100% complete request with all chunks and trailing headers populated,
@@ -384,4 +388,18 @@ public interface RequestInfo<T> {
      * do not need to worry about this issue - it's a problem for the server to solve.
      */
     public void releaseMultipartData();
+
+    /**
+     * This will return the path template set by {@link #setPathParamsBasedOnPathTemplate(String)},
+     * which corresponds to an endpoint {@link com.nike.riposte.util.Matcher}'s path template and is automatically set
+     * when a request is matched to an endpoint.
+     *
+     * <p>Example path template: "/app/{appId}/user/{userId}".
+     * Note this different than {@link #getPath()}, which in this example might be "/app/foo/user/bar".
+     *
+     * <p>Will never be null - an empty string will be used if {@link #setPathParamsBasedOnPathTemplate(String)}
+     * was never called (should only happen in error cases where an endpoint was not called).
+     */
+    public String getPathTemplate();
+
 }

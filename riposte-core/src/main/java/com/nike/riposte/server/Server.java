@@ -131,9 +131,10 @@ public class Server {
                 serverConfig.defaultCompletableFutureTimeoutInMillisForNonblockingEndpoints(),
                 serverConfig.accessLogger(), serverConfig.pipelineCreateHooks(),
                 serverConfig.requestSecurityValidator(), serverConfig.workerChannelIdleTimeoutMillis(),
-                serverConfig.proxyRouterConnectTimeoutMillis(),
+                serverConfig.proxyRouterConnectTimeoutMillis(), serverConfig.incompleteHttpCallTimeoutMillis(),
                 serverConfig.maxOpenIncomingServerChannels(), serverConfig.isDebugChannelLifecycleLoggingEnabled(),
-                serverConfig.userIdHeaderKeys()
+                serverConfig.userIdHeaderKeys(), serverConfig.responseCompressionThresholdBytes(),
+                serverConfig.httpRequestDecoderConfig()
             );
         }
 

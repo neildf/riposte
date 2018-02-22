@@ -1,9 +1,13 @@
 package com.nike.riposte.util;
 
+import com.nike.fastbreak.CircuitBreaker;
+import com.nike.fastbreak.CircuitBreakerImpl;
 import com.nike.internal.util.Pair;
 import com.nike.riposte.server.channelpipeline.ChannelAttributes;
 import com.nike.riposte.server.http.HttpProcessingState;
+import com.nike.riposte.server.http.ProxyRouterProcessingState;
 import com.nike.riposte.server.http.RequestInfo;
+import com.nike.riposte.server.testutils.TestUtil;
 import com.nike.riposte.util.asynchelperwrapper.BiConsumerWithTracingAndMdcSupport;
 import com.nike.riposte.util.asynchelperwrapper.BiFunctionWithTracingAndMdcSupport;
 import com.nike.riposte.util.asynchelperwrapper.CallableWithTracingAndMdcSupport;
@@ -32,6 +36,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -44,10 +52,13 @@ import io.netty.util.Attribute;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.catchThrowable;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyObject;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyZeroInteractions;
 
@@ -62,8 +73,11 @@ public class AsyncNettyHelperTest {
     private Channel channelMock;
     private ChannelHandlerContext ctxMock;
     private Attribute<HttpProcessingState> stateAttributeMock;
+    private Attribute<ProxyRouterProcessingState> proxyRouterStateAttrMock;
     private HttpProcessingState state;
+    private ProxyRouterProcessingState proxyRouterStateMock;
     private RequestInfo requestInfoMock;
+    private Executor executor;
 
     private Runnable runnableMock;
     private Callable callableMock;
@@ -81,11 +95,16 @@ public class AsyncNettyHelperTest {
         channelMock = mock(Channel.class);
         ctxMock = mock(ChannelHandlerContext.class);
         stateAttributeMock = mock(Attribute.class);
+        proxyRouterStateAttrMock = mock(Attribute.class);
         state = new HttpProcessingState();
+        proxyRouterStateMock = mock(ProxyRouterProcessingState.class);
         requestInfoMock = mock(RequestInfo.class);
+        executor = Executors.newCachedThreadPool();
         doReturn(channelMock).when(ctxMock).channel();
         doReturn(stateAttributeMock).when(channelMock).attr(ChannelAttributes.HTTP_PROCESSING_STATE_ATTRIBUTE_KEY);
         doReturn(state).when(stateAttributeMock).get();
+        doReturn(proxyRouterStateAttrMock).when(channelMock).attr(ChannelAttributes.PROXY_ROUTER_PROCESSING_STATE_ATTRIBUTE_KEY);
+        doReturn(proxyRouterStateMock).when(proxyRouterStateAttrMock).get();
         state.setRequestInfo(requestInfoMock);
 
         runnableMock = mock(Runnable.class);
@@ -481,6 +500,15 @@ public class AsyncNettyHelperTest {
         assertThat(AsyncNettyHelper.extractTracingAndMdcInfoFromChannelHandlerContext(null)).isNull();
     }
 
+    @Test
+    public void extractTracingAndMdcInfoFromChannelHandlerContext_returns_null_if_state_is_null() {
+        // given
+        doReturn(null).when(stateAttributeMock).get();
+
+        // expect
+        assertThat(AsyncNettyHelper.extractTracingAndMdcInfoFromChannelHandlerContext(ctxMock)).isNull();
+    }
+
     @DataProvider(value = {
         "true",
         "false"
@@ -750,15 +778,16 @@ public class AsyncNettyHelperTest {
     }
 
     @DataProvider(value = {
-        "true   |   true    |   true",
-        "false  |   true    |   true",
-        "false  |   true    |   false",
-        "false  |   false   |   true",
-        "false  |   false   |   false",
+        "true   |   true    |   true    |   true",
+        "false  |   true    |   true    |   true",
+        "false  |   true    |   false   |   true",
+        "false  |   false   |   true    |   true",
+        "false  |   false   |   false   |   true",
+        "false  |   false   |   false   |   false",
     }, splitBy = "\\|")
     @Test
     public void executeOnlyIfChannelIsActive_releases_request_resources_and_completes_trace_as_appropriate_when_channel_is_not_active(
-        boolean stateIsNull, boolean requestInfoIsNull, boolean isTraceCompletedOrScheduledSetup
+        boolean stateIsNull, boolean requestInfoIsNull, boolean isTraceCompletedOrScheduledSetup, boolean proxyRouterStateIsNull
     ) {
         // given
         Pair<Deque<Span>, Map<String, String>> stateInfo = setupStateWithTracingAndMdcInfo();
@@ -769,6 +798,9 @@ public class AsyncNettyHelperTest {
 
         if (requestInfoIsNull)
             state.setRequestInfo(null);
+
+        if (proxyRouterStateIsNull)
+            doReturn(null).when(proxyRouterStateAttrMock).get();
 
         state.setTraceCompletedOrScheduled(isTraceCompletedOrScheduledSetup);
 
@@ -789,6 +821,13 @@ public class AsyncNettyHelperTest {
             verify(requestInfoMock).releaseAllResources();
             assertThat(currentSpanStackWhenRequestResourcesReleased.get(0)).isEqualTo(stateInfo.getLeft());
             assertThat(currentMdcInfoWhenRequestResourcesReleased.get(0)).isEqualTo(stateInfo.getRight());
+        }
+
+        if (proxyRouterStateIsNull)
+            verifyZeroInteractions(proxyRouterStateMock);
+        else {
+            verify(proxyRouterStateMock).cancelRequestStreaming(any(), any());
+            verify(proxyRouterStateMock).cancelDownstreamRequest(any());
         }
 
         if (!stateIsNull && !isTraceCompletedOrScheduledSetup)
@@ -828,5 +867,109 @@ public class AsyncNettyHelperTest {
             MDC.getCopyOfContextMap()
         );
         assertThat(postCallTracingInfo).isEqualTo(preCallTracingInfo);
+    }
+
+    @Test
+    public void executeAsyncCall_shouldReturnCompletableFuture() throws Exception {
+        // given
+        String expectedResult = UUID.randomUUID().toString();
+        ctxMock = TestUtil.mockChannelHandlerContextWithTraceInfo().mockContext;
+        Span parentSpan = Tracer.getInstance().getCurrentSpan();
+        AtomicReference<Span> runningSpan = new AtomicReference<>();
+
+        // when
+        CompletableFuture<String> completableFuture = AsyncNettyHelper.supplyAsync(
+                () -> {
+                    runningSpan.set(Tracer.getInstance().getCurrentSpan());
+                    return expectedResult;
+                },
+                executor, ctxMock);
+
+        // then
+        assertThat(completableFuture.isCompletedExceptionally()).isFalse();
+        assertThat(completableFuture.get()).isEqualTo(expectedResult);
+        // verify new span is not created, but existing span does successfully hop threads
+        assertThat(runningSpan.get()).isEqualTo(parentSpan);
+    }
+
+    @Test
+    public void executeAsyncCall_shouldReturnCompletableFutureUsingCircuitBreaker() throws Exception {
+        // given
+        String expectedResult = UUID.randomUUID().toString();
+        ctxMock = TestUtil.mockChannelHandlerContextWithTraceInfo().mockContext;
+        CircuitBreaker<String> circuitBreaker = spy(new CircuitBreakerImpl<>());
+        Span parentSpan = Tracer.getInstance().getCurrentSpan();
+        AtomicReference<Span> runningSpan = new AtomicReference<>();
+
+        // when
+        CompletableFuture<String> circuitBreakerCompletableFuture = AsyncNettyHelper.supplyAsync(
+                () -> {
+                    runningSpan.set(Tracer.getInstance().getCurrentSpan());
+                    return expectedResult;
+                },
+                circuitBreaker, executor, ctxMock);
+
+        // then
+        verify(circuitBreaker).executeAsyncCall(anyObject());
+        assertThat(circuitBreakerCompletableFuture.isCompletedExceptionally()).isFalse();
+        assertThat(circuitBreakerCompletableFuture.get()).isEqualTo(expectedResult);
+        // verify new span is not created, but existing span does successfully hop threads
+        assertThat(runningSpan.get()).isEqualTo(parentSpan);
+    }
+
+    @Test
+    public void executeAsyncCall_shouldReturnCompletableFutureUsingSpanName() throws Exception {
+        // given
+        String expectedResult = UUID.randomUUID().toString();
+        String expectedSpanName = "nonCircuitBreakerWithSpan";
+        ctxMock = TestUtil.mockChannelHandlerContextWithTraceInfo().mockContext;
+        Span parentSpan = Tracer.getInstance().getCurrentSpan();
+        AtomicReference<Span> runningSpan = new AtomicReference<>();
+
+        // when
+        CompletableFuture<String> completableFuture = AsyncNettyHelper.supplyAsync(
+                expectedSpanName,
+                () -> {
+                    runningSpan.set(Tracer.getInstance().getCurrentSpan());
+                    return expectedResult;
+                },
+                executor, ctxMock);
+
+        // then
+        assertThat(completableFuture.isCompletedExceptionally()).isFalse();
+        assertThat(completableFuture.get()).isEqualTo(expectedResult);
+        // verify span is as expected
+        assertThat(runningSpan.get().getParentSpanId()).isEqualTo(parentSpan.getSpanId());
+        assertThat(runningSpan.get().getSpanName()).isEqualTo(expectedSpanName);
+        assertThat(runningSpan.get().getTraceId()).isEqualTo(parentSpan.getTraceId());
+    }
+
+    @Test
+    public void executeAsyncCall_shouldReturnCompletableFutureUsingCircuitBreakerWithSpanName() throws Exception {
+        // given
+        String expectedResult = UUID.randomUUID().toString();
+        String expectedSpanName = "circuitBreakerWithSpan";
+        ctxMock = TestUtil.mockChannelHandlerContextWithTraceInfo().mockContext;
+        Span parentSpan = Tracer.getInstance().getCurrentSpan();
+        CircuitBreaker<String> circuitBreaker = spy(new CircuitBreakerImpl<>());
+        AtomicReference<Span> runningSpan = new AtomicReference<>();
+
+        // when
+        CompletableFuture<String> circuitBreakerFuture = AsyncNettyHelper.supplyAsync(
+                expectedSpanName,
+                () -> {
+                    runningSpan.set(Tracer.getInstance().getCurrentSpan());
+                    return expectedResult;
+                },
+                circuitBreaker, executor, ctxMock);
+
+        // then
+        assertThat(circuitBreakerFuture.isCompletedExceptionally()).isFalse();
+        assertThat(circuitBreakerFuture.get()).isEqualTo(expectedResult);
+        verify(circuitBreaker).executeAsyncCall(anyObject());
+        // verify span is as expected
+        assertThat(runningSpan.get().getParentSpanId()).isEqualTo(parentSpan.getSpanId());
+        assertThat(runningSpan.get().getSpanName()).isEqualTo(expectedSpanName);
+        assertThat(runningSpan.get().getTraceId()).isEqualTo(parentSpan.getTraceId());
     }
 }

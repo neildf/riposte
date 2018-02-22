@@ -20,6 +20,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.nio.charset.Charset;
+import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -388,12 +389,11 @@ public class ResponseSender {
         actualResponseObject.headers().add(responseInfo.getHeaders());
 
         // Add cookies (if any)
-        if (responseInfo.getCookies() != null) {
-            for (Cookie cookie : responseInfo.getCookies()) {
-                actualResponseObject.headers().add(
-                    HttpHeaders.Names.SET_COOKIE, ServerCookieEncoder.LAX.encode(cookie.name(), cookie.value())
-                );
-            }
+        Set<Cookie> cookies = responseInfo.getCookies();
+        if (cookies != null && !cookies.isEmpty()) {
+            actualResponseObject.headers().add(
+                    HttpHeaders.Names.SET_COOKIE, ServerCookieEncoder.LAX.encode(cookies)
+            );
         }
     }
 
@@ -516,17 +516,24 @@ public class ResponseSender {
         if (state != null && isLastChunk) {
             // Set the state's responseWriterFinalChunkChannelFuture so that handlers can hook into it if desired.
             state.setResponseWriterFinalChunkChannelFuture(writeFuture);
+
+            // Always attach a listener that sets response end time.
+            writeFuture.addListener(future -> state.setResponseEndTimeNanosToNowIfNotAlreadySet());
         }
 
         // Always attach a listener that logs write errors.
         writeFuture.addListener(logOnWriteErrorOperationListener(ctx));
 
         // Finally, add the appropriate always-close-channel or close-channel-only-on-failure listener.
-        //      We only ever want to do a hard always-close if it's *not* a keep-alive connection *and* this is the last
-        //      chunk, *or* this is a force-close situation. Any other situation should be a close-only-on-failure.
-        if ((!requestInfo.isKeepAliveRequested() && isLastChunk)
-            || responseInfo.isForceConnectionCloseAfterResponseSent()) {
-
+        //      We only ever want to do a hard always-close in the case that this is the last chunk *and* one of the
+        //      following is true:
+        //      (1) it's *not* a keep-alive connection
+        //          *or*
+        //      (2) this is a force-close situation
+        //      Any other situation should be a close-only-on-failure.
+        if (isLastChunk
+            && (!requestInfo.isKeepAliveRequested() || responseInfo.isForceConnectionCloseAfterResponseSent())
+        ) {
             writeFuture.addListener(ChannelFutureListener.CLOSE);
         }
         else

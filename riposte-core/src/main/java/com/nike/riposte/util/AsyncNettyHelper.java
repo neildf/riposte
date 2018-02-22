@@ -1,8 +1,10 @@
 package com.nike.riposte.util;
 
+import com.nike.fastbreak.CircuitBreaker;
 import com.nike.internal.util.Pair;
 import com.nike.riposte.server.channelpipeline.ChannelAttributes;
 import com.nike.riposte.server.http.HttpProcessingState;
+import com.nike.riposte.server.http.ProxyRouterProcessingState;
 import com.nike.riposte.server.http.RequestInfo;
 import com.nike.riposte.util.asynchelperwrapper.BiConsumerWithTracingAndMdcSupport;
 import com.nike.riposte.util.asynchelperwrapper.BiFunctionWithTracingAndMdcSupport;
@@ -21,6 +23,8 @@ import org.slf4j.MDC;
 import java.util.Deque;
 import java.util.Map;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.Consumer;
@@ -61,6 +65,7 @@ import io.netty.channel.ChannelHandlerContext;
 public class AsyncNettyHelper {
 
     private static final Logger logger = LoggerFactory.getLogger(AsyncNettyHelper.class);
+    public static final Void VOID = null;
 
     // Intentionally protected - use the static methods.
     protected AsyncNettyHelper() { /* do nothing */ }
@@ -466,10 +471,26 @@ public class AsyncNettyHelper {
                     + "Releasing resources and stopping request processing. channel_inactive_cannot_continue_marker={}",
                     markerForLogs
                 );
+
+                // Gather the stuff we want to try to release resources for.
                 HttpProcessingState state = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
                 RequestInfo<?> requestInfo = (state == null) ? null : state.getRequestInfo();
+                ProxyRouterProcessingState proxyRouterState =
+                    ChannelAttributes.getProxyRouterProcessingStateForChannel(ctx).get();
+
+                // Tell the RequestInfo it can release all its resources.
                 if (requestInfo != null)
                     requestInfo.releaseAllResources();
+
+                // Tell the ProxyRouterProcessingState that the stream failed and trigger its chunk streaming error
+                //      handling with an artificial exception. If the call had already succeeded previously then this
+                //      will do nothing, but if it hasn't already succeeded then it's not going to (since the connection
+                //      is closing) and doing this will cause any resources it's holding onto to be released.
+                if (proxyRouterState != null) {
+                    Throwable reason = new RuntimeException("Cannot execute - Server worker channel closed");
+                    proxyRouterState.cancelRequestStreaming(reason, ctx);
+                    proxyRouterState.cancelDownstreamRequest(reason);
+                }
 
                 // Complete the trace only if there's no state, or if we have a state but the trace hasn't been
                 //      completed yet. If the state says the trace has already been completed we don't want to spit it
@@ -488,4 +509,88 @@ public class AsyncNettyHelper {
             }
         }
     }
+
+    /**
+     * Helper method for creating a `CompletableFuture` that is using the tracing helpers.
+     * <p>
+     * <pre>
+     * AsyncNettyHelper.supplyAsync(() -> {
+     *      //do some work in a background thread
+     *      return VOID;
+     * }, executor, ctx);
+     * </pre>
+     */
+    public static <U> CompletableFuture<U> supplyAsync(Supplier<U> f, Executor executor, ChannelHandlerContext ctx) {
+        return CompletableFuture.supplyAsync(supplierWithTracingAndMdc(f, ctx), executor);
+    }
+
+    /**
+     * Helper method for creating a `CompletableFuture` that is using the tracing helpers and has the CompletableFuture
+     * wrapped in a `CircuitBreaker`
+     * <p>
+     * <pre>
+     * AsyncNettyHelper.supplyAsync(() -> {
+     *      //do some work in a background thread
+     *      return VOID;
+     * }, circuitBreaker, executor, ctx);
+     * </pre>
+     */
+    public static <U> CompletableFuture<U> supplyAsync(Supplier<U> f, CircuitBreaker<U> circuitBreaker, Executor executor, ChannelHandlerContext ctx) {
+        return circuitBreaker.executeAsyncCall(() -> supplyAsync(f, executor, ctx));
+    }
+
+    /**
+     * Helper method for creating a `CompletableFuture` that is wrapped by a CircuitBreaker and
+     * has the `Supplier` wrapped around a SubSpan.
+     * <p>
+     * You would prefer this method over {@link #supplyAsync(Supplier, Executor, ChannelHandlerContext)} or
+     * {@link #supplyAsync(Supplier, CircuitBreaker, Executor, ChannelHandlerContext)}
+     * when your `Supplier` has logic that makes an outbound/downstream call. This will net you distributed tracing logs.
+     * <p>
+     * An example would be using a client SDK that makes blocking HTTP calls.
+     * <p>
+     * The SubSpan purpose will be set to `CLIENT` as this is the typical use case when utilizing these helpers.
+     * <p>
+     * <pre>
+     * AsyncNettyHelper.supplyAsync("someWorkToBeDone", () -> {
+     *      //do some work in a background thread
+     *      return VOID;
+     * }, circuitBreaker, executor, ctx);
+     * </pre>
+     */
+    public static <U> CompletableFuture<U> supplyAsync(String subSpanName, Supplier<U> f, CircuitBreaker<U> circuitBreaker, Executor executor, ChannelHandlerContext ctx) {
+        return circuitBreaker.executeAsyncCall(() -> supplyAsync(subSpanName, f, executor, ctx));
+    }
+
+    /**
+     * Helper method for creating a `CompletableFuture` that has the `Supplier` wrapped around a SubSpan.
+     * <p>
+     * You would prefer this method over the above when your `Supplier` has logic that makes an outbound/downstream call
+     * and you do not want the use of a `CircuitBreaker`.
+     * <p>
+     * You would prefer this method over {@link #supplyAsync(String, Supplier, CircuitBreaker, Executor, ChannelHandlerContext)}
+     * when your `Supplier` has logic that you would like wrapped with distributed tracing logs and not use a {@link CircuitBreaker}
+     * <p>
+     * An example would be using a client SDK that makes blocking HTTP calls.
+     * <p>
+     * The SubSpan purpose will be set to `CLIENT` as this is the typical use case when utilizing these helpers.
+     * <p>
+     * <pre>
+     * AsyncNettyHelper.supplyAsync("someWorkToBeDone", () -> {
+     *      //do some work in a background thread
+     *      return VOID;
+     * }, executor, ctx);
+     * </pre>
+     */
+    public static <U> CompletableFuture<U> supplyAsync(String subSpanName, Supplier<U> f, Executor executor, ChannelHandlerContext ctx) {
+        return CompletableFuture.supplyAsync(supplierWithTracingAndMdc(() -> {
+            try {
+                Tracer.getInstance().startSubSpan(subSpanName, Span.SpanPurpose.CLIENT);
+                return f.get();
+            } finally {
+                Tracer.getInstance().completeSubSpan();
+            }
+        }, ctx), executor);
+    }
+
 }

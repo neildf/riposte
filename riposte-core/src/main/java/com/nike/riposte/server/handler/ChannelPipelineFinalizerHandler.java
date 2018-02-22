@@ -7,20 +7,30 @@ import com.nike.riposte.server.error.handler.ErrorResponseBody;
 import com.nike.riposte.server.handler.base.BaseInboundHandlerWithTracingAndMdcSupport;
 import com.nike.riposte.server.handler.base.PipelineContinuationBehavior;
 import com.nike.riposte.server.http.HttpProcessingState;
+import com.nike.riposte.server.http.ProxyRouterProcessingState;
 import com.nike.riposte.server.http.RequestInfo;
 import com.nike.riposte.server.http.ResponseInfo;
 import com.nike.riposte.server.http.ResponseSender;
+import com.nike.riposte.server.http.impl.RequestInfoImpl;
+import com.nike.riposte.server.logging.AccessLogger;
 import com.nike.riposte.server.metrics.ServerMetricsEvent;
+import com.nike.wingtips.Span;
+import com.nike.wingtips.Tracer;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandler;
+import io.netty.channel.ChannelOutboundHandler;
+import io.netty.channel.ChannelPromise;
 
 import static com.nike.riposte.server.channelpipeline.HttpChannelInitializer.IDLE_CHANNEL_TIMEOUT_HANDLER_NAME;
+import static com.nike.riposte.util.AsyncNettyHelper.runnableWithTracingAndMdc;
 
 /**
  * Finalizes incoming messages so that the pipeline considers the message handled and won't throw an error. This first
@@ -40,7 +50,10 @@ public class ChannelPipelineFinalizerHandler extends BaseInboundHandlerWithTraci
     private final ExceptionHandlingHandler exceptionHandlingHandler;
     private final ResponseSender responseSender;
     private final MetricsListener metricsListener;
+    private final AccessLogger accessLogger;
     private final long workerChannelIdleTimeoutMillis;
+    private static final Throwable ARTIFICIAL_SERVER_WORKER_CHANNEL_CLOSED_EXCEPTION =
+        new RuntimeException("Server worker channel closed");
 
     /**
      * @param exceptionHandlingHandler
@@ -49,13 +62,17 @@ public class ChannelPipelineFinalizerHandler extends BaseInboundHandlerWithTraci
      * @param responseSender
      *     The {@link ResponseSender} that is used by the pipeline where this class is registered for sending data to
      *     the user.
+     * @param accessLogger The {@link AccessLogger} that is used by the pipeline where this class is registered for
+     * access logging (i.e. the same access logger set on {@link AccessLogEndHandler}).
      * @param workerChannelIdleTimeoutMillis
      *     The time in millis that should be given to {@link IdleChannelTimeoutHandler}s when they are created for
      *     detecting idle channels that need to be closed.
      */
     public ChannelPipelineFinalizerHandler(ExceptionHandlingHandler exceptionHandlingHandler,
                                            ResponseSender responseSender,
-                                           MetricsListener metricsListener, long workerChannelIdleTimeoutMillis) {
+                                           MetricsListener metricsListener,
+                                           AccessLogger accessLogger,
+                                           long workerChannelIdleTimeoutMillis) {
         if (exceptionHandlingHandler == null)
             throw new IllegalArgumentException("exceptionHandlingHandler cannot be null");
 
@@ -65,6 +82,7 @@ public class ChannelPipelineFinalizerHandler extends BaseInboundHandlerWithTraci
         this.exceptionHandlingHandler = exceptionHandlingHandler;
         this.responseSender = responseSender;
         this.metricsListener = metricsListener;
+        this.accessLogger = accessLogger;
         this.workerChannelIdleTimeoutMillis = workerChannelIdleTimeoutMillis;
     }
 
@@ -148,32 +166,7 @@ public class ChannelPipelineFinalizerHandler extends BaseInboundHandlerWithTraci
 
         ctx.flush();
 
-        // Send response sent event for metrics purposes now that we handled all possible cases.
-        //      Due to multiple messages and exception possibilities/interactions it's possible we've already dealt with
-        //      the metrics for this request, so make sure we only do it if appropriate.
-        if (metricsListener != null && !state.isRequestMetricsRecordedOrScheduled()) {
-            // If there was no response sent then do the metrics event now (should only happen under rare error
-            //      conditions), otherwise do it when the response finishes.
-            if (!state.isResponseSendingLastChunkSent()) {
-                // TODO: Somehow mark the state as a failed request and update the metrics listener to handle it
-                metricsListener.onEvent(ServerMetricsEvent.RESPONSE_SENT, state);
-            }
-            else {
-                // We need to use a copy of the state in case the original state gets cleaned.
-                HttpProcessingState stateCopy = new HttpProcessingState(state);
-                stateCopy.getResponseWriterFinalChunkChannelFuture()
-                         .addListener((ChannelFutureListener) channelFuture -> {
-                             if (channelFuture.isSuccess())
-                                 metricsListener.onEvent(ServerMetricsEvent.RESPONSE_SENT, stateCopy);
-                             else {
-                                 // TODO: Somehow mark the state as a failed request and update the metrics listener to handle it
-                                 metricsListener.onEvent(ServerMetricsEvent.RESPONSE_WRITE_FAILED, null);
-                             }
-                         });
-            }
-
-            state.setRequestMetricsRecordedOrScheduled(true);
-        }
+        handleMetricsForCompletedRequestIfNotAlreadyDone(state);
 
         // Make sure to clear out request info chunks, multipart data, and any other resources to prevent reference
         //      counting memory leaks (or any other kind of memory leaks).
@@ -190,7 +183,182 @@ public class ChannelPipelineFinalizerHandler extends BaseInboundHandlerWithTraci
         // If we're in an error case (cause != null) and the response sending has started but not completed, then this
         //      request is broken. We can't do anything except kill the channel.
         if ((cause != null) && state.isResponseSendingStarted() && !state.isResponseSendingLastChunkSent()) {
+            runnableWithTracingAndMdc(
+                () -> logger.error(
+                    "Received an error in ChannelPipelineFinalizerHandler after response sending was started, but "
+                    + "before it finished. Closing the channel. unexpected_error={}", cause.toString()
+                ),
+                ctx
+            ).run();
             ctx.channel().close();
+        }
+    }
+
+    protected void handleMetricsForCompletedRequestIfNotAlreadyDone(HttpProcessingState state) {
+        // Send response-sent event for metrics purposes now that we handled all possible cases.
+        //      Due to multiple messages and exception possibilities/interactions it's possible we've already dealt with
+        //      the metrics for this request, so make sure we only do it if appropriate.
+        if (metricsListener != null && !state.isRequestMetricsRecordedOrScheduled()) {
+            state.setRequestMetricsRecordedOrScheduled(true);
+
+            // If there was no response sent then do the metrics event now (should only happen under rare error
+            //      conditions), otherwise do it when the response finishes.
+            if (!state.isResponseSendingLastChunkSent()) {
+                // TODO: Somehow mark the state as a failed request and update the metrics listener to handle it
+                metricsListener.onEvent(ServerMetricsEvent.RESPONSE_WRITE_FAILED, state);
+            }
+            else {
+                // We need to use a copy of the state in case the original state gets cleaned.
+                HttpProcessingState stateCopy = new HttpProcessingState(state);
+                stateCopy.getResponseWriterFinalChunkChannelFuture()
+                         .addListener((ChannelFutureListener) channelFuture -> {
+                             if (channelFuture.isSuccess())
+                                 metricsListener.onEvent(ServerMetricsEvent.RESPONSE_SENT, stateCopy);
+                             else {
+                                 // TODO: Somehow mark the state as a failed request and update the metrics listener to handle it
+                                 metricsListener.onEvent(ServerMetricsEvent.RESPONSE_WRITE_FAILED, null);
+                             }
+                         });
+            }
+        }
+    }
+
+    /**
+     * This method is used as the final cleanup safety net for when a channel is closed. It guarantees that any
+     * {@link ByteBuf}s being held by {@link RequestInfo} or {@link ProxyRouterProcessingState} are {@link
+     * ByteBuf#release()}d so that we don't end up with a memory leak.
+     *
+     * <p>Note that we can't use {@link ChannelOutboundHandler#close(ChannelHandlerContext, ChannelPromise)} for this
+     * purpose as it is only called if we close the connection in our application code. It won't be triggered if
+     * (for example) the caller closes the connection, and we need it to *always* run for *every* closed connection,
+     * no matter the source of the close. {@link ChannelInboundHandler#channelInactive(ChannelHandlerContext)} is always
+     * called, so we're using that.
+     */
+    @Override
+    public PipelineContinuationBehavior doChannelInactive(ChannelHandlerContext ctx) throws Exception {
+        try {
+            // Grab hold of the things we may need when cleaning up.
+            HttpProcessingState httpState = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
+            ProxyRouterProcessingState proxyRouterState =
+                ChannelAttributes.getProxyRouterProcessingStateForChannel(ctx).get();
+
+            if (httpState == null) {
+                if (proxyRouterState == null) {
+                    logger.debug("This channel closed before it processed any requests. Nothing to cleanup. "
+                                 + "current_span={}", Tracer.getInstance().getCurrentSpan());
+                }
+                else {
+                    // This should never happen, but if it does we'll try to release what we can and then return.
+                    logger.error("Found a channel where HttpProcessingState was null, but ProxyRouterProcessingState "
+                                 + "was not null. This should not be possible! "
+                                 + "current_span={}", Tracer.getInstance().getCurrentSpan());
+                    releaseProxyRouterStateResources(proxyRouterState, ctx);
+                }
+
+                // With httpState null, there's nothing left for us to do.
+                return PipelineContinuationBehavior.CONTINUE;
+            }
+
+            RequestInfo<?> requestInfo = httpState.getRequestInfo();
+            ResponseInfo<?> responseInfo = httpState.getResponseInfo();
+
+            if (logger.isDebugEnabled()) {
+                runnableWithTracingAndMdc(
+                    () -> logger.debug("Cleaning up channel after it was closed. closed_channel_id={}",
+                                       ctx.channel().toString()),
+                    ctx
+                ).run();
+            }
+
+            // The request/response is definitely done at this point since the channel is closing. Set the response end
+            //      time if it hasn't already been done.
+            httpState.setResponseEndTimeNanosToNowIfNotAlreadySet();
+
+            // Handle the case where the response wasn't fully sent or tracing wasn't completed for some reason.
+            //      We want to finish the distributed tracing span for this request since there's no other place it
+            //      might be done, and if the request wasn't fully sent then we should spit out a log message so
+            //      debug investigations can find out what happened.
+            @SuppressWarnings("SimplifiableConditionalExpression")
+            boolean tracingAlreadyCompleted = httpState.isTraceCompletedOrScheduled();
+            boolean responseNotFullySent = responseInfo == null || !responseInfo.isResponseSendingLastChunkSent();
+            if (responseNotFullySent || !tracingAlreadyCompleted) {
+                runnableWithTracingAndMdc(
+                    () -> {
+                        if (responseNotFullySent) {
+                            logger.warn(
+                                "The caller's channel was closed before a response could be sent. Distributed tracing "
+                                + "will be completed now if it wasn't already done, and we will attempt to output an "
+                                + "access log if needed. Any dangling resources will be released. "
+                                + "response_info_is_null={}",
+                                (responseInfo == null)
+                            );
+                        }
+
+                        if (!tracingAlreadyCompleted) {
+                            httpState.setTraceCompletedOrScheduled(true);
+
+                            Span currentSpan = Tracer.getInstance().getCurrentSpan();
+                            if (currentSpan != null && !currentSpan.isCompleted())
+                                Tracer.getInstance().completeRequestSpan();
+                        }
+                    },
+                    ctx
+                ).run();
+            }
+
+            // Make sure access logging is handled
+            if (!httpState.isAccessLogCompletedOrScheduled() && accessLogger != null) {
+                httpState.setAccessLogCompletedOrScheduled(true);
+
+                RequestInfo<?> requestInfoToUse = (requestInfo == null)
+                                                  ? RequestInfoImpl.dummyInstanceForUnknownRequests()
+                                                  : requestInfo;
+                accessLogger.log(
+                    requestInfoToUse, httpState.getActualResponseObject(), responseInfo,
+                    httpState.calculateTotalRequestTimeMillis()
+                );
+            }
+
+            // Make sure metrics is handled
+            handleMetricsForCompletedRequestIfNotAlreadyDone(httpState);
+
+            // Tell the RequestInfo it can release all its resources.
+            if (requestInfo != null)
+                requestInfo.releaseAllResources();
+
+            releaseProxyRouterStateResources(proxyRouterState, ctx);
+        }
+        catch(Throwable t) {
+            runnableWithTracingAndMdc(
+                () -> logger.error(
+                    "An unexpected error occurred during ChannelPipelineFinalizerHandler.doChannelInactive() - this "
+                    + "should not happen and indicates a bug that needs to be fixed in Riposte.", t),
+                ctx
+            ).run();
+        }
+
+        return PipelineContinuationBehavior.CONTINUE;
+    }
+
+    /**
+     * Tell the ProxyRouterProcessingState that the request streaming is cancelled so that it will trigger its chunk
+     * streaming error handling with an artificial exception. If the call had already succeeded previously then this
+     * will do nothing, but if it hasn't already succeeded then it's not going to (since the connection is closing) and
+     * doing this will cause any resources it's holding onto to be released.
+     *
+     * <p>Also tell ProxyRouterProcessingState to cancel any downstream call. If the downstream call had already
+     * finished this would do nothing.
+     *
+     * @param proxyRouterState The state to cleanup.
+     */
+    protected void releaseProxyRouterStateResources(ProxyRouterProcessingState proxyRouterState,
+                                                    ChannelHandlerContext ctx) {
+        if (proxyRouterState != null) {
+            proxyRouterState.cancelRequestStreaming(
+                ARTIFICIAL_SERVER_WORKER_CHANNEL_CLOSED_EXCEPTION,
+                ctx
+            );
+            proxyRouterState.cancelDownstreamRequest(ARTIFICIAL_SERVER_WORKER_CHANNEL_CLOSED_EXCEPTION);
         }
     }
 }

@@ -3,6 +3,7 @@ package com.nike.riposte.server.handler;
 import com.nike.internal.util.Pair;
 import com.nike.riposte.server.channelpipeline.ChannelAttributes;
 import com.nike.riposte.server.channelpipeline.message.LastOutboundMessageSendFullResponseInfo;
+import com.nike.riposte.server.error.exception.InvalidHttpRequestException;
 import com.nike.riposte.server.handler.base.PipelineContinuationBehavior;
 import com.nike.riposte.server.http.HttpProcessingState;
 import com.nike.riposte.server.http.RequestInfo;
@@ -12,6 +13,7 @@ import com.nike.riposte.server.http.filter.RequestAndResponseFilter;
 import com.tngtech.java.junit.dataprovider.DataProvider;
 import com.tngtech.java.junit.dataprovider.DataProviderRunner;
 
+import org.assertj.core.api.Assertions;
 import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -25,12 +27,17 @@ import java.util.function.BiFunction;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.DecoderResult;
+import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpHeaders;
+import io.netty.handler.codec.http.HttpMessage;
 import io.netty.handler.codec.http.HttpRequest;
+import io.netty.handler.codec.http.HttpVersion;
 import io.netty.handler.codec.http.LastHttpContent;
 import io.netty.util.Attribute;
-import io.netty.util.ReferenceCounted;
 
+import static com.nike.riposte.server.handler.base.BaseInboundHandlerWithTracingAndMdcSupport.HandlerMethodToExecute.DO_CHANNEL_READ;
 import static com.nike.riposte.server.handler.base.PipelineContinuationBehavior.CONTINUE;
 import static com.nike.riposte.server.handler.base.PipelineContinuationBehavior.DO_NOT_FIRE_CONTINUE_EVENT;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -122,6 +129,59 @@ public class RequestFilterHandlerTest {
     }
 
     @DataProvider(value = {
+        "true",
+        "false"
+    })
+    @Test
+    public void doChannelRead_HttpRequest_creates_and_sets_RequestInfo_on_state_only_if_state_not_already_set(
+        boolean requestInfoAlreadySetOnState
+    ) throws Exception {
+        // given
+        doReturn(CONTINUE).when(handlerSpy).handleFilterLogic(any(), any(), any(), any(), any());
+
+        RequestInfo<?> requestInfoAlreadyOnState = (requestInfoAlreadySetOnState) ? requestInfoMock : null;
+        state.setRequestInfo(requestInfoAlreadyOnState);
+
+        HttpProcessingState stateSpy = spy(state);
+        doReturn(stateSpy).when(stateAttributeMock).get();
+
+        String uri = "/some/url";
+        HttpHeaders headers = new DefaultHttpHeaders();
+        doReturn(uri).when(firstChunkMsgMock).getUri();
+        doReturn(headers).when(firstChunkMsgMock).headers();
+        doReturn(HttpVersion.HTTP_1_1).when(firstChunkMsgMock).getProtocolVersion();
+
+        // when
+        handlerSpy.doChannelRead(ctxMock, firstChunkMsgMock);
+
+        // then
+        if (requestInfoAlreadySetOnState) {
+            verify(stateSpy, never()).setRequestInfo(any(RequestInfo.class));
+            assertThat(stateSpy.getRequestInfo()).isSameAs(requestInfoMock);
+        }
+        else {
+            verify(stateSpy).setRequestInfo(any(RequestInfo.class));
+            assertThat(stateSpy.getRequestInfo()).isNotEqualTo(requestInfoMock);
+            assertThat(stateSpy.getRequestInfo().getUri()).isEqualTo(uri);
+        }
+    }
+
+    @Test
+    public void doChannelRead_HttpRequest_throws_exception_when_failed_decoder_result() {
+        // given
+        DecoderResult decoderResult = mock(DecoderResult.class);
+        doReturn(true).when(decoderResult).isFailure();
+        doReturn(decoderResult).when(firstChunkMsgMock).getDecoderResult();
+        state.setRequestInfo(null);
+
+        // when
+        Throwable thrownException = Assertions.catchThrowable(() -> handlerSpy.doChannelRead(ctxMock, firstChunkMsgMock));
+
+        // then
+        assertThat(thrownException).isExactlyInstanceOf(InvalidHttpRequestException.class);
+    }
+
+    @DataProvider(value = {
         "CONTINUE",
         "DO_NOT_FIRE_CONTINUE_EVENT"
     }, splitBy = "\\|")
@@ -130,7 +190,7 @@ public class RequestFilterHandlerTest {
         PipelineContinuationBehavior expectedPipelineContinuationBehavior
     ) throws Exception {
         // given
-        doReturn(expectedPipelineContinuationBehavior).when(handlerSpy).handleFilterLogic(any(), any(), any(), any());
+        doReturn(expectedPipelineContinuationBehavior).when(handlerSpy).handleFilterLogic(any(), any(), any(), any(), any());
 
         // when
         PipelineContinuationBehavior result = handlerSpy.doChannelRead(ctxMock, firstChunkMsgMock);
@@ -142,6 +202,7 @@ public class RequestFilterHandlerTest {
         ArgumentCaptor<BiFunction> shortCircuitFilterCallCaptor = ArgumentCaptor.forClass(BiFunction.class);
         verify(handlerSpy).handleFilterLogic(eq(ctxMock),
                                              eq(firstChunkMsgMock),
+                                             eq(state),
                                              normalFilterCallCaptor.capture(),
                                              shortCircuitFilterCallCaptor.capture());
 
@@ -166,7 +227,7 @@ public class RequestFilterHandlerTest {
         PipelineContinuationBehavior expectedPipelineContinuationBehavior
     ) throws Exception {
         // given
-        doReturn(expectedPipelineContinuationBehavior).when(handlerSpy).handleFilterLogic(any(), any(), any(), any());
+        doReturn(expectedPipelineContinuationBehavior).when(handlerSpy).handleFilterLogic(any(), any(), any(), any(), any());
 
         // when
         PipelineContinuationBehavior result = handlerSpy.doChannelRead(ctxMock, lastChunkMsgMock);
@@ -178,6 +239,7 @@ public class RequestFilterHandlerTest {
         ArgumentCaptor<BiFunction> shortCircuitFilterCallCaptor = ArgumentCaptor.forClass(BiFunction.class);
         verify(handlerSpy).handleFilterLogic(eq(ctxMock),
                                              eq(lastChunkMsgMock),
+                                             eq(state),
                                              normalFilterCallCaptor.capture(),
                                              shortCircuitFilterCallCaptor.capture());
 
@@ -203,16 +265,18 @@ public class RequestFilterHandlerTest {
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
-        verify(handlerSpy, never()).handleFilterLogic(any(), any(), any(), any());
+        verify(handlerSpy, never()).handleFilterLogic(any(), any(), any(), any(), any());
     }
 
     private class HandleFilterLogicMethodCallArgs {
         public final Object msg;
+        public final HttpProcessingState httpState;
         public final BiFunction<RequestAndResponseFilter, RequestInfo, RequestInfo> normalFilterCall;
         public final BiFunction<RequestAndResponseFilter, RequestInfo, Pair<RequestInfo, Optional<ResponseInfo<?>>>> shortCircuitFilterCall;
 
         private HandleFilterLogicMethodCallArgs(boolean isFirstChunk) {
             this.msg = (isFirstChunk) ? firstChunkMsgMock : lastChunkMsgMock;
+            this.httpState = state;
             this.normalFilterCall = (isFirstChunk)
                                     ? (filter, request) -> filter.filterRequestFirstChunkNoPayload(request, ctxMock)
                                     : (filter, request) -> filter.filterRequestLastChunkWithFullPayload(request, ctxMock);
@@ -233,7 +297,7 @@ public class RequestFilterHandlerTest {
         filtersList.forEach(filter -> doReturn(false).when(filter).isShortCircuitRequestFilter());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -257,7 +321,7 @@ public class RequestFilterHandlerTest {
         filtersList.forEach(filter -> doReturn(true).when(filter).isShortCircuitRequestFilter());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -282,7 +346,7 @@ public class RequestFilterHandlerTest {
         doReturn(false).when(filtersList.get(1)).isShortCircuitRequestFilter();
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -319,7 +383,7 @@ public class RequestFilterHandlerTest {
         doThrow(new RuntimeException("kaboom")).when(filtersList.get(explodingFilterIndex)).filterRequestLastChunkWithFullPayload(any(), any());
 
         // when
-        handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         filtersList.forEach(filter -> {
@@ -349,7 +413,7 @@ public class RequestFilterHandlerTest {
         doReturn(secondFilterResult).when(filter2Mock).filterRequestLastChunkWithFullPayload(any(), any());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -391,7 +455,7 @@ public class RequestFilterHandlerTest {
         doReturn(Pair.of(secondFilterResult, Optional.empty())).when(filter2Mock).filterRequestLastChunkWithOptionalShortCircuitResponse(any(), any());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -434,7 +498,7 @@ public class RequestFilterHandlerTest {
         doReturn(secondFilterResult).when(filter2Mock).filterRequestLastChunkWithFullPayload(any(), any());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         assertThat(result).isEqualTo(CONTINUE);
@@ -485,7 +549,7 @@ public class RequestFilterHandlerTest {
             .when(shortCircuitingFilter).filterRequestLastChunkWithOptionalShortCircuitResponse(any(), any());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         // Pipeline stops for the given msg event.
@@ -505,10 +569,6 @@ public class RequestFilterHandlerTest {
 
         // The state is updated with the ResponseInfo returned by the filter.
         assertThat(state.getResponseInfo()).isSameAs(returnedResponseInfoMock);
-
-        // The given msg object's reference count is decremented (if it is ReferenceCounted).
-        if (args.msg instanceof ReferenceCounted)
-            verify((ReferenceCounted)args.msg).release();
 
         // The short circuiting "we're all done, return the response to the caller" event is fired down the pipeline.
         verify(ctxMock).fireChannelRead(LastOutboundMessageSendFullResponseInfo.INSTANCE);
@@ -545,7 +605,7 @@ public class RequestFilterHandlerTest {
             .when(shortCircuitingFilter).filterRequestLastChunkWithOptionalShortCircuitResponse(any(), any());
 
         // when
-        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.normalFilterCall, args.shortCircuitFilterCall);
+        PipelineContinuationBehavior result = handlerSpy.handleFilterLogic(ctxMock, args.msg, args.httpState, args.normalFilterCall, args.shortCircuitFilterCall);
 
         // then
         // Pipeline continues - no short circuit.
@@ -566,11 +626,27 @@ public class RequestFilterHandlerTest {
         // The state is NOT updated with the ResponseInfo returned by the filter.
         assertThat(state.getResponseInfo()).isNull();
 
-        // The given msg object's reference count is NOT decremented (if it is ReferenceCounted).
-        if (args.msg instanceof ReferenceCounted)
-            verify((ReferenceCounted)args.msg, never()).release();
-
         // The short circuiting "we're all done, return the response to the caller" event is NOT fired down the pipeline.
         verify(ctxMock, never()).fireChannelRead(LastOutboundMessageSendFullResponseInfo.INSTANCE);
     }
+
+    @Test
+    public void argsAreEligibleForLinkingAndUnlinkingDistributedTracingInfo_only_returns_true_for_HttpRequest_or_LastHttpContent() {
+        // given
+        Object httpRequestMsg = mock(HttpRequest.class);
+        Object lastHttpContentMsg = mock(LastHttpContent.class);
+        Object httpMessageMsg = mock(HttpMessage.class);
+
+        // expect
+        assertThat(handlerSpy.argsAreEligibleForLinkingAndUnlinkingDistributedTracingInfo(
+            DO_CHANNEL_READ, ctxMock, httpRequestMsg, null)
+        ).isTrue();
+        assertThat(handlerSpy.argsAreEligibleForLinkingAndUnlinkingDistributedTracingInfo(
+            DO_CHANNEL_READ, ctxMock, lastHttpContentMsg, null)
+        ).isTrue();
+        assertThat(handlerSpy.argsAreEligibleForLinkingAndUnlinkingDistributedTracingInfo(
+            DO_CHANNEL_READ, ctxMock, httpMessageMsg, null)
+        ).isFalse();
+    }
+
 }

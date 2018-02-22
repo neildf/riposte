@@ -90,6 +90,15 @@ public abstract class ProxyRouterEndpoint implements Endpoint {
     }
 
     /**
+     * Proxy router endpoints don't generally want to require request content due to the varied request types it can
+     * serve. This is similar and goes in sync with {@link #requestContentType()} and {@link #isValidateRequestContent(RequestInfo)}
+     */
+    @Override
+    public boolean isRequireRequestContent() {
+        return false;
+    }
+
+    /**
      * Helper method that generates a {@link HttpRequest} for the downstream call's first chunk that uses the given
      * downstreamPath and downstreamMethod, and the query string and headers from the incomingRequest will be added and
      * passed through without modification.
@@ -172,6 +181,14 @@ public abstract class ProxyRouterEndpoint implements Endpoint {
          * security vulnerabilities - make sure you know what you're doing.
          */
         public boolean relaxedHttpsValidation = false;
+        /**
+         * Set this to false if you do not want a SubSpan around your proxied downstream call
+         */
+        public boolean performSubSpanAroundDownstreamCall = true;
+        /**
+         * Set this to false if you do not want the standard tracing headers to be added to your downstream call
+         */
+        public boolean addTracingHeadersToDownstreamCall = true;
 
         /**
          * Creates a new instance with the given values, and defaults {@link #customCircuitBreaker} to {@link
@@ -229,5 +246,39 @@ public abstract class ProxyRouterEndpoint implements Endpoint {
             this.relaxedHttpsValidation = relaxedHttpsValidation;
             return this;
         }
+
+        /**
+         * Pass in false if you do not want SubSpans created around your downstream call
+         */
+        public DownstreamRequestFirstChunkInfo withPerformSubSpanAroundDownstreamCall(boolean performSubSpanAroundDownstreamCall) {
+            this.performSubSpanAroundDownstreamCall = performSubSpanAroundDownstreamCall;
+            return this;
+        }
+
+        /**
+         * Pass in false if you do not want the standard tracing headers added to your downstream call
+         */
+        public DownstreamRequestFirstChunkInfo withAddTracingHeadersToDownstreamCall(boolean addTracingHeadersToDownstreamCall) {
+            this.addTracingHeadersToDownstreamCall = addTracingHeadersToDownstreamCall;
+            return this;
+        }
+    }
+
+    /**
+     * Proxy router endpoints don't generally want to limit the request size they are proxying, so return 0 to disable
+     */
+    @Override
+    public Integer maxRequestSizeInBytesOverride() {
+        return 0;
+    }
+
+    /**
+     * @return This returns false by default for proxy router endpoints so that the payload will reach the downstream
+     * target unchanged - override this method if you want the proxy router endpoint to automatically decompress the
+     * payload as it passes through.
+     */
+    @Override
+    public boolean isDecompressRequestPayloadAllowed(RequestInfo request) {
+        return false;
     }
 }

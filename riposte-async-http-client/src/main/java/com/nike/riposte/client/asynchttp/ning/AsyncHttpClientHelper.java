@@ -1,6 +1,7 @@
 package com.nike.riposte.client.asynchttp.ning;
 
 import com.nike.fastbreak.CircuitBreaker;
+import com.nike.fastbreak.CircuitBreaker.ManualModeTask;
 import com.nike.fastbreak.CircuitBreakerDelegate;
 import com.nike.fastbreak.exception.CircuitBreakerOpenException;
 import com.nike.riposte.server.channelpipeline.ChannelAttributes;
@@ -8,13 +9,12 @@ import com.nike.riposte.server.http.HttpProcessingState;
 import com.nike.wingtips.Span;
 import com.nike.wingtips.TraceHeaders;
 import com.nike.wingtips.Tracer;
-
 import com.ning.http.client.AsyncHttpClient;
 import com.ning.http.client.AsyncHttpClientConfig;
 import com.ning.http.client.NameResolver;
 import com.ning.http.client.Response;
+import com.ning.http.client.SignatureCalculator;
 import com.ning.http.client.uri.Uri;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.slf4j.MDC;
@@ -112,7 +112,7 @@ public class AsyncHttpClientHelper {
     private final Logger logger = LoggerFactory.getLogger(this.getClass());
 
     protected final AsyncHttpClient asyncHttpClient;
-    protected final boolean performSubSpanAroundDownstreamCalls;
+    protected boolean performSubSpanAroundDownstreamCalls;
 
     /**
      * Constructor that gives you maximum control over configuration and behavior.
@@ -177,6 +177,26 @@ public class AsyncHttpClientHelper {
      */
     public AsyncHttpClientHelper() {
         this(true);
+    }
+
+    /**
+     * Sets the default {@link SignatureCalculator} that will used when making requests with the configured
+     * {@link AsyncHttpClient}.
+     * <p>
+     * {@link SignatureCalculator} is a class that is normally used to set a header based on the full request being sent.
+     * It provides a hook as the last step before sending the request.
+     */
+    public AsyncHttpClientHelper setDefaultSignatureCalculator(SignatureCalculator signatureCalculator) {
+        asyncHttpClient.setSignatureCalculator(signatureCalculator);
+        return this;
+    }
+
+    /**
+     * Sets the flag to determine if SubSpan are created around the downstream calls
+     */
+    public AsyncHttpClientHelper setPerformSubSpanAroundDownstreamCalls(boolean performSubSpanAroundDownstreamCalls) {
+        this.performSubSpanAroundDownstreamCalls = performSubSpanAroundDownstreamCalls;
+        return this;
     }
 
     /**
@@ -325,16 +345,18 @@ public class AsyncHttpClientHelper {
         CompletableFuture<O> completableFutureResponse = new CompletableFuture<>();
 
         try {
-            Optional<CircuitBreaker<Response>> circuitBreaker = getCircuitBreaker(requestBuilderWrapper);
+            Optional<ManualModeTask<Response>> circuitBreakerManualTask =
+                getCircuitBreaker(requestBuilderWrapper).map(CircuitBreaker::newManualModeTask);
+
             // If we have a circuit breaker, give it a chance to throw an exception if the circuit is open/tripped
-            circuitBreaker.ifPresent(CircuitBreaker::throwExceptionIfCircuitBreakerIsOpen);
+            circuitBreakerManualTask.ifPresent(ManualModeTask::throwExceptionIfCircuitBreakerIsOpen);
 
             // Setup the async completion handler for the call.
             AsyncCompletionHandlerWithTracingAndMdcSupport<O> asyncCompletionHandler =
                 new AsyncCompletionHandlerWithTracingAndMdcSupport<>(
                     completableFutureResponse, responseHandlerFunction, performSubSpanAroundDownstreamCalls,
                     requestBuilderWrapper.httpMethod,
-                    requestBuilderWrapper.url, circuitBreaker, distributedTraceStackForCall, mdcContextForCall);
+                    requestBuilderWrapper.url, circuitBreakerManualTask, distributedTraceStackForCall, mdcContextForCall);
 
             // Add distributed trace headers to the downstream call if we have a span.
             Span spanForCall = asyncCompletionHandler.getSpanForCall();
@@ -422,4 +444,5 @@ public class AsyncHttpClientHelper {
             return InetAddress.getAllByName(host);
         }
     }
+
 }

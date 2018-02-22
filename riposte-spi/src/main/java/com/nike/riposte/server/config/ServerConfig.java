@@ -348,6 +348,23 @@ public interface ServerConfig {
     }
 
     /**
+     * @return The amount of time in milliseconds that the server should wait without receiving a chunk from the caller
+     * once the first chunk has been received but before the last chunk has arrived. If a request has been started (we
+     * have received the first chunk of the request) but not yet finished, and this amount of time passes without any
+     * further chunks from the caller being received, then a {@link
+     * com.nike.riposte.server.error.exception.IncompleteHttpCallTimeoutException} will be thrown and an appropriate
+     * error response returned to the caller.
+     *
+     * <p>If this method returns a value less than or equal to 0 then the incomplete call timeout functionality will
+     * be disabled. Be careful with turning this feature off - broken clients or attackers could effectively cause a
+     * memory leak by flooding a server with invalid HTTP requests that never complete while keeping the connection
+     * open indefinitely.
+     */
+    default long incompleteHttpCallTimeoutMillis() {
+        return 5 * 1000;
+    }
+
+    /**
      * @return The maximum allowed number of open channels for the server (incoming channels), with -1 indicating
      * unlimited. Each open channel represents an open socket/connection on the server so this number effectively limits
      * the number of <b>concurrent</b> requests and/or the number of keep-alive connections (whether they are active or
@@ -371,14 +388,28 @@ public interface ServerConfig {
     }
 
     /**
-     * @return The maximum allowed request size in bytes. If netty receives a request larger than this then it will
-     * throw a {@link io.netty.handler.codec.TooLongFrameException}.
+     * @return The maximum allowed request size in bytes. If Riposte receives a request larger than this then it will
+     * throw a {@link com.nike.riposte.server.error.exception.RequestTooBigException}.
+     *
      * This value is an integer, so the max you can set it to is {@link Integer#MAX_VALUE}, which corresponds to 2^31-1,
      * or 2147483647 (around 2 GB).
-     * <p><b>NOTE: This feature is currently disabled - this value will do nothing at the moment.</b>
+     *
+     * A value of 0 or less is disabling the max request size validation. Defaulting to no limit.
      */
     default int maxRequestSizeInBytes() {
-        return Integer.MAX_VALUE;
+        return 0;
+    }
+
+    /**
+     * @return The size threshold (in bytes) above which response payloads are eligible for gzip/deflate compression.
+     * Compressing small payloads can actually result in a "compressed" payload that is larger than the original and
+     * in that case you're using extra CPU for a worse outcome. If a response payload's size is smaller than the
+     * byte threshold value returned by this method then it will not be automatically compressed. You can also disable
+     * compression on a per-response basis by setting {@link
+     * com.nike.riposte.server.http.ResponseInfo#setPreventCompressedOutput(boolean)} to true.
+     */
+    default int responseCompressionThresholdBytes() {
+        return 500;
     }
 
     /**
@@ -492,5 +523,74 @@ public interface ServerConfig {
      */
     default List<String> userIdHeaderKeys() {
         return null;
+    }
+
+    /**
+     * @return The {@link HttpRequestDecoderConfig} that should be used when creating the {@link
+     * io.netty.handler.codec.http.HttpRequestDecoder#HttpRequestDecoder(int, int, int)} handler used to decode incoming
+     * bytes into HTTP message objects, or null if you want to use the default values.
+     *
+     * <p><b>It's recommended that you return null or use the {@link HttpRequestDecoderConfig#DEFAULT_IMPL} unless
+     * you're sure you know what you're doing!</b>
+     *
+     * <p>The default values are 4096 bytes for max initial line length, 8192 bytes for max combined header line length,
+     * and 8192 max chunk size. See the javadocs for {@link HttpRequestDecoderConfig} and its methods for more details.
+     */
+    default HttpRequestDecoderConfig httpRequestDecoderConfig() {
+        return null;
+    }
+
+    /**
+     * Config options that will be used when creating the {@link
+     * io.netty.handler.codec.http.HttpRequestDecoder#HttpRequestDecoder(int, int, int)} handler used to decode incoming
+     * bytes into HTTP message objects.
+     *
+     * <p><b>It's recommended that you use the {@link #DEFAULT_IMPL} unless you're sure you know what you're doing!</b>
+     *
+     * <p>Please see the javadocs on {@link io.netty.handler.codec.http.HttpRequestDecoder} for full details on these
+     * options.
+     */
+    interface HttpRequestDecoderConfig {
+
+        /**
+         * Statically accessible implementation of the {@link HttpRequestDecoderConfig} interface that returns the
+         * default values.
+         */
+        HttpRequestDecoderConfig DEFAULT_IMPL = new HttpRequestDecoderConfig() {};
+
+        /**
+         * Defaults to 4096. Please see the javadocs on {@link io.netty.handler.codec.http.HttpRequestDecoder} for full
+         * details on this option.
+         *
+         * @return The maximum allowed length of the initial line (e.g. {@code "GET /some/path HTTP/1.1"}) - if the
+         * length of the initial line exceeds this value then an exception will be thrown that will map to an
+         * appropriate HTTP status code 400 response.
+         */
+        default int maxInitialLineLength() {
+            return 4096;
+        }
+
+        /**
+         * Defaults to 8192. Please see the javadocs on {@link io.netty.handler.codec.http.HttpRequestDecoder} for full
+         * details on this option.
+         *
+         * @return The maximum allowed length of all headers combined. If the sum of the length of all headers exceeds
+         * this value then an exception will be thrown that will map to an appropriate HTTP status code 431 response.
+         */
+        default int maxHeaderSize() {
+            return 8192;
+        }
+
+        /**
+         * Defaults to 8192. Please see the javadocs on {@link io.netty.handler.codec.http.HttpRequestDecoder} for full
+         * details on this option.
+         *
+         * @return The maximum length of each chunk of the content - unlike the other options in this interface
+         * exceeding this limit does not cause an exception to be thrown, instead it just tells Netty how to chunk
+         * the incoming payload. <b>You shouldn't need to adjust this for the vast majority of Riposte projects!</b>
+         */
+        default int maxChunkSize() {
+            return 8192;
+        }
     }
 }

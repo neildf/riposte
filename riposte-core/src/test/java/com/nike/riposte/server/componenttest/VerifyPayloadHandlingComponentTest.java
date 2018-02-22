@@ -17,7 +17,6 @@ import com.google.common.hash.HashCode;
 import com.google.common.hash.HashFunction;
 import com.google.common.hash.Hasher;
 import com.google.common.hash.Hashing;
-import com.jayway.restassured.response.ExtractableResponse;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -36,14 +35,15 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.util.CharsetUtil;
+import io.restassured.response.ExtractableResponse;
 
-import static com.jayway.restassured.RestAssured.given;
+import static io.restassured.RestAssured.given;
 import static java.util.Collections.singleton;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Verifies that request payloads are automatically deserialized correctly, and that response payloads are serialized (if appropriate) and sent down the wire
- * correctly.
+ * Verifies that request payloads are automatically deserialized correctly, and that response payloads are serialized
+ * (if appropriate) and sent down the wire correctly.
  *
  * @author Nic Munroe
  */
@@ -200,6 +200,31 @@ public class VerifyPayloadHandlingComponentTest {
     }
 
     @Test
+    public void verify_request_payload_received_for_byte_array_input_type() {
+        String requestPayload = UUID.randomUUID().toString();
+        byte[] payloadBytes = requestPayload.getBytes(CharsetUtil.UTF_8);
+        String payloadHash = getHashForPayload(payloadBytes);
+
+        ExtractableResponse response =
+            given()
+                .baseUri("http://127.0.0.1")
+                .port(serverConfig.endpointsPort())
+                .basePath(ByteArrayTypeDeserializer.MATCHING_PATH)
+                .header(REQUEST_PAYLOAD_HASH_HEADER_KEY, payloadHash)
+                .body(requestPayload)
+                .log().all()
+            .when()
+                .post()
+            .then()
+                .log().all()
+                .statusCode(200)
+                .extract();
+
+        String responsePayload = response.asString();
+        assertThat(responsePayload).isEqualTo("success_string");
+    }
+
+    @Test
     public void verify_request_payload_received_for_widget_input_type() throws JsonProcessingException {
         SerializableObject widget = new SerializableObject(UUID.randomUUID().toString(), generateRandomBytes(32));
         String requestPayload = objectMapper.writeValueAsString(widget);
@@ -291,6 +316,7 @@ public class VerifyPayloadHandlingComponentTest {
                 new SerializableObjectPayloadReturner(),
                 new VoidTypeDeserializer(),
                 new StringTypeDeserializer(),
+                new ByteArrayTypeDeserializer(),
                 new WidgetTypeDeserializer(),
                 new DownstreamProxyNonSsl(downstreamPortNonSsl),
                 new DownstreamProxySsl(downstreamPortSsl)
@@ -500,6 +526,30 @@ public class VerifyPayloadHandlingComponentTest {
                 throw new IllegalStateException(
                     "Since the deserialized type is String, getContent() should return the same thing as getRawContent(). getContent(): " + request
                         .getContent() + " - getRawContent(): " + request.getRawContent());
+            }
+
+            verifyIncomingPayloadByteHash(request, true);
+
+            return CompletableFuture.completedFuture(ResponseInfo.newBuilder("success_string").build());
+        }
+
+        @Override
+        public Matcher requestMatcher() {
+            return Matcher.match(MATCHING_PATH);
+        }
+    }
+
+    public static class ByteArrayTypeDeserializer extends StandardEndpoint<byte[], String> {
+
+        public static final String MATCHING_PATH = "/byteArrayDeserializer";
+
+        @Override
+        public CompletableFuture<ResponseInfo<String>> execute(RequestInfo<byte[]> request, Executor longRunningTaskExecutor, ChannelHandlerContext ctx) {
+            if (!request.getContent().equals(request.getRawContentBytes())) {
+                throw new IllegalStateException(
+                    "Since the deserialized type is byte[], getContent() should return the same thing as "
+                    + "getRawContentBytes(). getContent(): " + request.getContent() + " - getRawContentBytes(): "
+                    + request.getRawContentBytes());
             }
 
             verifyIncomingPayloadByteHash(request, true);

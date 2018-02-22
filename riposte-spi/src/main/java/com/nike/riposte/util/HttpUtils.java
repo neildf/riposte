@@ -2,6 +2,7 @@ package com.nike.riposte.util;
 
 import com.nike.riposte.server.error.exception.InvalidCharsetInContentTypeHeaderException;
 import com.nike.riposte.server.error.exception.PathParameterMatchingException;
+import com.nike.riposte.server.http.Endpoint;
 import com.nike.riposte.server.http.RequestInfo;
 
 import java.nio.charset.Charset;
@@ -159,7 +160,7 @@ public class HttpUtils {
         int bytesWrittenSoFar = 0;
         for (ByteBuf chunk : chunkByteBufs) {
             int numBytesInThisChunk = chunk.readableBytes();
-            chunk.getBytes(0, comboBytes, bytesWrittenSoFar, chunk.readableBytes());
+            chunk.getBytes(chunk.readerIndex(), comboBytes, bytesWrittenSoFar, chunk.readableBytes());
             bytesWrittenSoFar += numBytesInThisChunk;
         }
 
@@ -212,5 +213,18 @@ public class HttpUtils {
         }
 
         return downstreamDestinationUriPath;
+    }
+
+    public static boolean isMaxRequestSizeValidationDisabled(int configuredMaxRequestSize) {
+        return configuredMaxRequestSize <= 0;
+    }
+
+    public static int getConfiguredMaxRequestSize(Endpoint<?> endpoint, int globalConfiguredMaxRequestSizeInBytes) {
+        //if the endpoint is null or the endpoint is not overriding, we should return the globally configured value
+        if (endpoint == null || endpoint.maxRequestSizeInBytesOverride() == null) {
+            return globalConfiguredMaxRequestSizeInBytes;
+        }
+
+        return endpoint.maxRequestSizeInBytesOverride();
     }
 }

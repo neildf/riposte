@@ -46,7 +46,8 @@ public class ServerConfigTest {
         assertThat(defaultImpl.riposteUnhandledErrorHandler(), notNullValue());
         assertThat(defaultImpl.numBossThreads(), is(1));
         assertThat(defaultImpl.numWorkerThreads(), is(0));
-        assertThat(defaultImpl.maxRequestSizeInBytes(), is(Integer.MAX_VALUE));
+        assertThat(defaultImpl.maxRequestSizeInBytes(), is(0));
+        assertThat(defaultImpl.responseCompressionThresholdBytes(), is(500));
         assertThat(defaultImpl.createSslContext(), notNullValue());
         assertThat(defaultImpl.requestContentValidationService(), nullValue());
         assertThat(defaultImpl.isDebugActionsEnabled(), is(false));
@@ -57,6 +58,7 @@ public class ServerConfigTest {
         assertThat(defaultImpl.isDebugChannelLifecycleLoggingEnabled(), is(false));
         assertThat(defaultImpl.workerChannelIdleTimeoutMillis(), is(5000L));
         assertThat(defaultImpl.proxyRouterConnectTimeoutMillis(), is(10000L));
+        assertThat(defaultImpl.incompleteHttpCallTimeoutMillis(), is(5000L));
         assertThat(defaultImpl.maxOpenIncomingServerChannels(), is(20000));
         assertThat(defaultImpl.pipelineCreateHooks(), nullValue());
         assertThat(defaultImpl.customChannelInitializer(), nullValue());

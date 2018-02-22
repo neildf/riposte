@@ -1,8 +1,5 @@
 package com.nike.riposte.server.handler;
 
-import com.nike.riposte.server.channelpipeline.ChannelAttributes;
-import com.nike.riposte.server.http.HttpProcessingState;
-
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -22,10 +19,10 @@ import io.netty.handler.timeout.IdleStateHandler;
 @SuppressWarnings("WeakerAccess")
 public class IdleChannelTimeoutHandler extends IdleStateHandler {
 
-    private final Logger logger = LoggerFactory.getLogger(this.getClass());
+    private static final Logger logger = LoggerFactory.getLogger(IdleChannelTimeoutHandler.class);
 
-    private final String customHandlerIdForLogs;
-    private final long idleTimeoutMillis;
+    protected final String customHandlerIdForLogs;
+    protected final long idleTimeoutMillis;
 
     public IdleChannelTimeoutHandler(long idleTimeoutMillis, String customHandlerIdForLogs) {
         super(0, 0, (int) idleTimeoutMillis, TimeUnit.MILLISECONDS);
@@ -35,22 +32,26 @@ public class IdleChannelTimeoutHandler extends IdleStateHandler {
 
     @Override
     protected void channelIdle(ChannelHandlerContext ctx, IdleStateEvent evt) throws Exception {
-        logger.debug(
-            "Closing server channel due to idle timeout. "
-            + "custom_handler_id={}, idle_timeout_millis={}, worker_channel_being_closed={}",
-            customHandlerIdForLogs, idleTimeoutMillis, ctx.channel().toString()
-        );
+        channelIdleTriggered(ctx, evt);
 
-        // Release any state if possible.
-        HttpProcessingState state = ChannelAttributes.getHttpProcessingStateForChannel(ctx).get();
-        if (state != null) {
-            state.getRequestInfo().releaseAllResources();
-            state.cleanStateForNewRequest();
-        }
-
-        // Close the channel.
+        // Close the channel. ChannelPipelineFinalizerHandler.channelInactive(...) will ensure that content is released.
         ctx.channel().close();
 
         super.channelIdle(ctx, evt);
+    }
+
+    /**
+     * Helper method that is called when the idle channel event is triggered, but before anything else happens
+     * in {@link #channelIdle(ChannelHandlerContext, IdleStateEvent)}. This is usually used to add an appropriate
+     * log message.
+     */
+    protected void channelIdleTriggered(ChannelHandlerContext ctx, IdleStateEvent evt) {
+        if (logger.isDebugEnabled()) {
+            logger.debug(
+                "Closing server channel due to idle timeout. "
+                + "custom_handler_id={}, idle_timeout_millis={}, worker_channel_being_closed={}",
+                customHandlerIdForLogs, idleTimeoutMillis, ctx.channel().toString()
+            );
+        }
     }
 }
